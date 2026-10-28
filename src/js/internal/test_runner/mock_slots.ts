@@ -16,7 +16,9 @@ const WeakMapPrototypeGet = WeakMap.prototype.get;
 const WeakMapPrototypeSet = WeakMap.prototype.set;
 
 // undefined where nothing calls restoreMockedSlots(): outside `bun test`, and in a Worker.
-let mockedSlots: Map<object, Map<PropertyKey, PropertyDescriptor>> | undefined;
+// The key comes first: a test file mocks few property names, on any number of objects. The map
+// of a name is made once and kept, so a mock allocates nothing here.
+let mockedSlots: Map<PropertyKey, Map<object, PropertyDescriptor>> | undefined;
 // For a mock made in a slot that already held one: the descriptor it found → the one before the first mock.
 const origins = new WeakMap<PropertyDescriptor, PropertyDescriptor>();
 
@@ -27,10 +29,10 @@ function trackMockedSlots() {
 /** A mock replaced `object[key]`, which held `found`. */
 function slotMocked(object: object, key: PropertyKey, found: PropertyDescriptor) {
   if (mockedSlots === undefined) return;
-  let keys = mockedSlots.$get(object);
-  if (keys === undefined) mockedSlots.$set(object, (keys = new Map()));
-  const origin = keys.$get(key);
-  if (origin === undefined) keys.$set(key, found);
+  let objects = mockedSlots.$get(key);
+  if (objects === undefined) mockedSlots.$set(key, (objects = new Map()));
+  const origin = objects.$get(object);
+  if (origin === undefined) objects.$set(object, found);
   else WeakMapPrototypeSet.$call(origins, found, origin);
 }
 
@@ -38,14 +40,14 @@ function slotMocked(object: object, key: PropertyKey, found: PropertyDescriptor)
 function slotRestored(object: object, key: PropertyKey, found: PropertyDescriptor) {
   if (mockedSlots === undefined) return;
   const origin: PropertyDescriptor | undefined = WeakMapPrototypeGet.$call(origins, found);
-  let keys = mockedSlots.$get(object);
-  if (origin !== undefined) {
-    // `found` is an earlier mock, and the slot holds it again.
-    if (keys === undefined) mockedSlots.$set(object, (keys = new Map()));
-    keys.$set(key, origin);
-  } else if (keys !== undefined && keys.$delete(key) && keys.$size === 0) {
-    mockedSlots.$delete(object);
+  let objects = mockedSlots.$get(key);
+  if (origin === undefined) {
+    objects?.$delete(object);
+    return;
   }
+  // `found` is an earlier mock, and the slot holds it again.
+  if (objects === undefined) mockedSlots.$set(key, (objects = new Map()));
+  objects.$set(object, origin);
 }
 
 /** Gives every slot that still holds a mock the descriptor it had before its first mock. */
@@ -54,8 +56,8 @@ function restoreMockedSlots() {
   if (slots === undefined || slots.$size === 0) return;
   // A setter or a proxy that a restore runs can mock again. That mock belongs to the next file.
   mockedSlots = new Map();
-  slots.$forEach((keys, object) => {
-    keys.$forEach((origin, key) => {
+  slots.$forEach((objects, key) => {
+    objects.$forEach((origin, object) => {
       try {
         Object.defineProperty(object, key, origin);
       } catch {
