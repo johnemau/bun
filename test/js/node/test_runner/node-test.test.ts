@@ -1,6 +1,6 @@
 import { spawn } from "bun";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, tempDir } from "harness";
 import { join } from "node:path";
 
 describe("node:test", () => {
@@ -520,4 +520,509 @@ test("mock.property/mock.method survive a polluted Object.prototype", async () =
   });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   expect({ stdout: stdout.trim(), stderr, exitCode }).toMatchObject({ stdout: "ok", exitCode: 0 });
+});
+
+// node runs each test file in a process of its own. `bun test` runs the files of a run in one
+// realm, so node:test puts back what a file left mocked before the next file is loaded.
+describe("node:test between the files of one run", () => {
+  // A debug+ASAN `bun test` child takes several seconds, and most of these run at the same time.
+  // The tests of the files get the same time.
+  const timeout = 30_000;
+
+  // Every fixture loads this first. `bun test` loads a module once for a run, so the files of a
+  // run share these objects, and mocked() compares with what the first file of the run found.
+  const shared = `
+    const path = require("node:path");
+    const timers = require("node:timers");
+    const timersPromises = require("node:timers/promises");
+
+    const target = {
+      method() {
+        return "real";
+      },
+      rootHookMethod() {
+        return "real";
+      },
+      get accessor() {
+        return "real";
+      },
+      set accessor(value) {},
+      property: "real",
+    };
+
+    const slots = {
+      "target.method": [target, "method"],
+      "target.rootHookMethod": [target, "rootHookMethod"],
+      "target.accessor": [target, "accessor"],
+      "target.property": [target, "property"],
+      "path.basename": [path, "basename"],
+      "AbortSignal.timeout": [AbortSignal, "timeout"],
+      "Date": [globalThis, "Date"],
+      "scheduler.wait": [timersPromises.scheduler, "wait"],
+    };
+    for (const name of ["setTimeout", "setInterval", "setImmediate"]) {
+      const clear = name.replace("set", "clear");
+      slots[name] = [globalThis, name];
+      slots[clear] = [globalThis, clear];
+      slots["timers." + name] = [timers, name];
+      slots["timers." + clear] = [timers, clear];
+      slots["timers/promises." + name] = [timersPromises, name];
+    }
+
+    const parts = descriptor => [descriptor?.value, descriptor?.get, descriptor?.set];
+    const held = name => parts(Object.getOwnPropertyDescriptor(...slots[name]));
+    const heldAtFirst = Object.fromEntries(Object.keys(slots).map(name => [name, held(name)]));
+
+    module.exports = {
+      target,
+      // A bare mock.fn() that a file leaves here.
+      spy: undefined,
+      // The names of what does not hold the function or the value that it held at first.
+      mocked() {
+        const names = Object.keys(slots).filter(name => held(name).some((part, i) => part !== heldAtFirst[name][i]));
+        if (this.spy !== undefined && this.spy() !== "original") names.push("mock.fn");
+        return names.sort();
+      },
+    };
+  `;
+
+  // A file that looks at what the file before it left, before it touches the test module.
+  const follower = (label: string, testModule: "node:test" | "bun:test" = "node:test") => `
+    const shared = require("./shared.js");
+    const atLoad = shared.mocked();
+    const { test } = require("${testModule}");
+    const assert = require("node:assert");
+    test("${label}: nothing is mocked when the file loads", () => assert.deepStrictEqual(atLoad, []));
+    test("${label}: nothing is mocked in a test", () => assert.deepStrictEqual(shared.mocked(), []));
+  `;
+  const nothingIsMocked = (label: string) => [
+    `(pass) ${label}: nothing is mocked when the file loads`,
+    `(pass) ${label}: nothing is mocked in a test`,
+  ];
+
+  // Mocks made on top of mocks. As in node, each mock writes back what it found, so undoing them
+  // first mock first does not put the real function back.
+  const mocksOnMocks = (afterHook: string) => `
+    const shared = require("./shared.js");
+    const { test, mock, beforeEach, after } = require("node:test");
+    const assert = require("node:assert");
+    const path = require("node:path");
+
+    let count = 0;
+    // One slot is mocked again before each test and never restored.
+    beforeEach(() => {
+      mock.method(path, "basename", () => "mocked " + ++count);
+    });
+
+    test("a module-level mock over the mock of a test", t => {
+      assert.strictEqual(path.basename("/x/y"), "mocked 1");
+      // The end of the test restores the mocks of the test. The module-level ones found those.
+      t.mock.method(shared.target, "method", () => "of the test");
+      mock.method(shared.target, "method", () => "module-level");
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      mock.timers.enable({ apis: ["setTimeout"] });
+    });
+
+    test("a slot that is mocked twice", () => {
+      assert.strictEqual(path.basename("/x/y"), "mocked 2");
+    });
+    ${afterHook}
+  `;
+
+  /** Runs `bun test` on the files, in this order. */
+  async function runFiles(dir: string, files: string[], args: string[] = [], hangGuard?: number) {
+    await using proc = spawn({
+      cmd: [bunExe(), "test", "--timeout", String(timeout), ...args, ...files.map(file => "./" + file)],
+      cwd: dir,
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: hangGuard,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const tests = stderr
+      .split(/\r?\n/)
+      .filter(line => /^\((pass|fail)\) /.test(line))
+      .map(line => line.replace(/ \[[\d.]+ms\]$/, ""));
+    // What the files printed: the first line of stdout is the version of `bun test`.
+    const printed = stdout.split(/\r?\n/).filter(line => line !== "" && !line.startsWith("bun test v"));
+    return { tests, printed, stderr, exitCode, signalCode: proc.signalCode };
+  }
+
+  // Not one of the concurrent tests below: a time limit is what tells it that the second file hangs.
+  test(
+    "mock timers that a file leaves are gone when the next file awaits a timer as it loads",
+    async () => {
+      using dir = tempDir("node-test-files-timers", {
+        "a-timers.test.js": `
+          const { test, mock } = require("node:test");
+          test("a1", () => {
+            mock.timers.enable({ apis: ["setTimeout"] });
+          });
+        `,
+        "b-timers.test.mjs": `
+          await new Promise(resolve => setTimeout(resolve, 10));
+          const { test } = await import("node:test");
+          test("b1", () => {});
+        `,
+      });
+      // A mocked setTimeout never calls back, and the second file would never finish loading.
+      const hangGuard = timeout / 2;
+      const { tests, exitCode, signalCode, stderr } = await runFiles(
+        String(dir),
+        ["a-timers.test.js", "b-timers.test.mjs"],
+        [],
+        hangGuard,
+      );
+      expect({ tests, exitCode, signalCode }, stderr).toEqual({
+        tests: ["(pass) a1", "(pass) b1"],
+        exitCode: 0,
+        signalCode: null,
+      });
+    },
+    timeout,
+  );
+
+  describe.concurrent("the mocks that a file leaves", () => {
+    test(
+      "a method mock that a file leaves is gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-method", {
+          "a-method.test.js": `
+            const { test, mock } = require("node:test");
+            const assert = require("node:assert");
+            const path = require("node:path");
+            mock.method(path, "basename", () => "mocked");
+            test("a1", () => {
+              assert.equal(path.basename("/x/y"), "mocked");
+            });
+          `,
+          "b-method.test.js": `
+            const got = require("node:path").basename("/x/y");
+            const { test } = require("node:test");
+            test("b1", () => {
+              require("node:assert").equal(got, "y");
+            });
+          `,
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["a-method.test.js", "b-method.test.js"]);
+        expect({ tests, exitCode }, stderr).toEqual({ tests: ["(pass) a1", "(pass) b1"], exitCode: 0 });
+      },
+      timeout,
+    );
+
+    test(
+      "every kind of mock that a file leaves is gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-kinds", {
+          "shared.js": shared,
+          "leaves-every-kind.js": `
+            const shared = require("./shared.js");
+            const { test, mock, before, after } = require("node:test");
+            const assert = require("node:assert");
+            const path = require("node:path");
+
+            mock.method(path, "basename", () => "mocked");
+            mock.method(shared.target, "method", () => "mocked");
+            mock.getter(shared.target, "accessor", () => "mocked");
+            mock.property(shared.target, "property", "mocked");
+            shared.spy = mock.fn(
+              () => "original",
+              () => "mocked",
+            );
+            // The tracker of the file itself, not the module-level one.
+            before(t => {
+              t.mock.method(shared.target, "rootHookMethod", () => "mocked");
+            });
+
+            test("leaves every kind of mock installed", () => {
+              mock.timers.enable();
+              assert.deepStrictEqual(shared.mocked(), [
+                "AbortSignal.timeout",
+                "Date",
+                "clearImmediate",
+                "clearInterval",
+                "clearTimeout",
+                "mock.fn",
+                "path.basename",
+                "scheduler.wait",
+                "setImmediate",
+                "setInterval",
+                "setTimeout",
+                "target.accessor",
+                "target.method",
+                "target.property",
+                "target.rootHookMethod",
+                "timers.clearImmediate",
+                "timers.clearInterval",
+                "timers.clearTimeout",
+                "timers.setImmediate",
+                "timers.setInterval",
+                "timers.setTimeout",
+                "timers/promises.setImmediate",
+                "timers/promises.setInterval",
+                "timers/promises.setTimeout",
+              ]);
+            });
+
+            // The mocks stay for all of the file: its own last hook still finds them.
+            after(() => assert.strictEqual(path.basename("/x/y"), "mocked"));
+          `,
+          "follower.js": follower("next file"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["leaves-every-kind.js", "follower.js"]);
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: ["(pass) leaves every kind of mock installed", ...nothingIsMocked("next file")],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "mocks on mocks that a file leaves are gone when a bun:test file loads next",
+      async () => {
+        using dir = tempDir("node-test-files-stacked", {
+          "shared.js": shared,
+          "mocks-on-mocks.js": mocksOnMocks(""),
+          "follower.js": follower("bun:test file", "bun:test"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["mocks-on-mocks.js", "follower.js"]);
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: [
+            "(pass) a module-level mock over the mock of a test",
+            "(pass) a slot that is mocked twice",
+            ...nothingIsMocked("bun:test file"),
+          ],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "the first mock of each slot, which mock.reset() leaves as in node, is gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-stacked-reset", {
+          "shared.js": shared,
+          "mocks-on-mocks.js": mocksOnMocks(`
+            after(() => {
+              mock.reset();
+              assert.deepStrictEqual(shared.mocked(), [
+                "clearTimeout",
+                "path.basename",
+                "setTimeout",
+                "target.method",
+                "timers.clearTimeout",
+                "timers.setTimeout",
+                "timers/promises.setTimeout",
+              ]);
+            });
+          `),
+          "follower.js": follower("next file"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["mocks-on-mocks.js", "follower.js"]);
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: [
+            "(pass) a module-level mock over the mock of a test",
+            "(pass) a slot that is mocked twice",
+            ...nothingIsMocked("next file"),
+          ],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "a mock that cannot be restored fails nothing, and the mocks after it are gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-unrestorable", {
+          "shared.js": shared,
+          "leaves-unrestorable.js": `
+            require("./shared.js");
+            const { test, mock } = require("node:test");
+            const assert = require("node:assert");
+            const path = require("node:path");
+            const { Writable } = require("node:stream");
+
+            // "destroyed" is an accessor of Writable.prototype that is not configurable. The mock gives
+            // the stream a copy that is not configurable either, so nothing can put the first one back.
+            const stream = new Writable();
+            mock.getter(stream, "destroyed", () => true);
+            mock.method(path, "basename", () => "mocked");
+
+            test("leaves a mock that cannot be restored, and one made after it", () => {
+              assert.throws(() => mock.restoreAll(), TypeError);
+              assert.strictEqual(stream.destroyed, true);
+              assert.strictEqual(path.basename("/x/y"), "mocked");
+            });
+          `,
+          "follower.js": follower("next file"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["leaves-unrestorable.js", "follower.js"]);
+        expect({ tests, exitCode, errors: stderr.match(/^ *\d+ errors?$/m) }, stderr).toEqual({
+          tests: [
+            "(pass) leaves a mock that cannot be restored, and one made after it",
+            ...nothingIsMocked("next file"),
+          ],
+          exitCode: 0,
+          errors: null,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "mocks of a file that throws as it loads are gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-load-error", {
+          "shared.js": shared,
+          "throws-as-it-loads.js": `
+            require("./shared.js");
+            const { mock } = require("node:test");
+            mock.method(require("node:path"), "basename", () => "mocked");
+            mock.timers.enable({ apis: ["setTimeout"] });
+            throw new Error("thrown while the file loads");
+          `,
+          "follower.js": follower("next file"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["throws-as-it-loads.js", "follower.js"]);
+        expect(stderr).toContain("error: thrown while the file loads");
+        expect({ tests, exitCode }, stderr).toEqual({ tests: nothingIsMocked("next file"), exitCode: 1 });
+      },
+      timeout,
+    );
+
+    test(
+      "mocks of a file that runs no test are gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-no-test-runs", {
+          "shared.js": shared,
+          "leaves-in-a-test-that-is-left-out.js": `
+            require("./shared.js");
+            const { test, mock } = require("node:test");
+            mock.method(require("node:path"), "basename", () => "mocked");
+            mock.timers.enable({ apis: ["setTimeout"] });
+            test("the name filter leaves this test out", () => {});
+          `,
+          "follower.js": follower("kept by the name filter"),
+        });
+        const { tests, exitCode, stderr } = await runFiles(
+          String(dir),
+          ["leaves-in-a-test-that-is-left-out.js", "follower.js"],
+          ["-t", "kept by the name filter"],
+        );
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: nothingIsMocked("kept by the name filter"),
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    // The second file is loaded in the same realm for each of these.
+    test.each([
+      ["--rerun-each", ["--rerun-each=3"], ["again.mjs"], 3],
+      ["a --parallel worker with --no-isolate", ["--parallel=1", "--no-isolate"], ["again.mjs", "again-2.mjs"], 2],
+    ] as const)(
+      "mocks that a file leaves are gone when %s loads a file",
+      async (_, args, files, runs) => {
+        const again = `
+          import { test, mock } from "node:test";
+          import assert from "node:assert";
+          import path from "node:path";
+          import shared from "./shared.js";
+
+          const atLoad = shared.mocked();
+          test("nothing is mocked when the file loads", () => {
+            assert.deepStrictEqual(atLoad, []);
+            mock.method(path, "basename", () => "mocked");
+            mock.timers.enable({ apis: ["setTimeout"] });
+          });
+        `;
+        using dir = tempDir("node-test-files-again", {
+          "shared.js": shared,
+          "again.mjs": again,
+          "again-2.mjs": again,
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), [...files], [...args]);
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: Array(runs).fill("(pass) nothing is mocked when the file loads"),
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    // Each write to the property prints a line: one for the mock, and one if node:test restores it.
+    const mocksAProxy = {
+      "mocks-a-proxy.js": `
+        const { test, mock } = require("node:test");
+        const target = new Proxy(
+          { method() {} },
+          {
+            defineProperty(object, key, descriptor) {
+              console.log("defineProperty " + String(key));
+              return Reflect.defineProperty(object, key, descriptor);
+            },
+          },
+        );
+        mock.method(target, "method", () => {});
+        test("leaves a mock on a proxy", () => {});
+      `,
+      "next-file.js": `
+        console.log("the next file loads");
+        require("node:test").test("the next file", () => {});
+      `,
+    };
+
+    test(
+      "what a file leaves is restored once, before the first statement of the next file",
+      async () => {
+        using dir = tempDir("node-test-files-once", mocksAProxy);
+        const { printed, exitCode, stderr } = await runFiles(String(dir), ["mocks-a-proxy.js", "next-file.js"]);
+        expect({ printed, exitCode }, stderr).toEqual({
+          printed: ["defineProperty method", "defineProperty method", "the next file loads"],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "nothing is restored in the realm that --isolate leaves",
+      async () => {
+        using dir = tempDir("node-test-files-isolate", mocksAProxy);
+        const { printed, exitCode, stderr } = await runFiles(
+          String(dir),
+          ["mocks-a-proxy.js", "next-file.js"],
+          ["--isolate"],
+        );
+        expect({ printed, exitCode }, stderr).toEqual({
+          printed: ["defineProperty method", "the next file loads"],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "an 'exit' listener of the last file still finds the mocks of that file, as in node",
+      async () => {
+        using dir = tempDir("node-test-files-exit", {
+          "only-file.js": `
+            const { test, mock } = require("node:test");
+            const path = require("node:path");
+            mock.method(path, "basename", () => "mocked");
+            process.on("exit", () => console.log("at exit: " + path.basename("/x/y")));
+            test("the only file of the run", () => {});
+          `,
+        });
+        const { printed, exitCode, stderr } = await runFiles(String(dir), ["only-file.js"]);
+        expect({ printed, exitCode }, stderr).toEqual({ printed: ["at exit: mocked"], exitCode: 0 });
+      },
+      timeout,
+    );
+  });
 });
