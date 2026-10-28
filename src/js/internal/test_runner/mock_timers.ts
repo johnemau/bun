@@ -10,6 +10,7 @@ const {
   validateUint32,
 } = require("internal/validators");
 const { addAbortListener } = require("internal/abort_listener");
+const { slotMocked, slotRestored } = require("internal/test_runner/mock_slots");
 
 const nodeTimers = require("node:timers");
 
@@ -227,6 +228,18 @@ class Timeout {
   }
 }
 
+// What a slot held before a fake replaced it, and what reset() writes back. See mock_slots.ts.
+function takeDescriptor(object: object, key: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(object, key);
+  if (descriptor !== undefined) slotMocked(object, key, descriptor);
+  return descriptor;
+}
+
+function putDescriptor(object: object, key: string, descriptor: PropertyDescriptor) {
+  Object.defineProperty(object, key, descriptor);
+  slotRestored(object, key, descriptor);
+}
+
 class MockTimers {
   #realSetTimeout;
   #realClearTimeout;
@@ -264,19 +277,19 @@ class MockTimers {
   #clearImmediate = this.#clearTimer.bind(this);
 
   #restoreSetImmediate() {
-    Object.defineProperty(globalThis, "setImmediate", this.#realSetImmediate);
-    Object.defineProperty(globalThis, "clearImmediate", this.#realClearImmediate);
-    Object.defineProperty(nodeTimers, "setImmediate", this.#realTimersSetImmediate);
-    Object.defineProperty(nodeTimers, "clearImmediate", this.#realTimersClearImmediate);
-    Object.defineProperty(nodeTimersPromises, "setImmediate", this.#realPromisifiedSetImmediate);
+    putDescriptor(globalThis, "setImmediate", this.#realSetImmediate);
+    putDescriptor(globalThis, "clearImmediate", this.#realClearImmediate);
+    putDescriptor(nodeTimers, "setImmediate", this.#realTimersSetImmediate);
+    putDescriptor(nodeTimers, "clearImmediate", this.#realTimersClearImmediate);
+    putDescriptor(nodeTimersPromises, "setImmediate", this.#realPromisifiedSetImmediate);
   }
 
   #restoreOriginalSetInterval() {
-    Object.defineProperty(globalThis, "setInterval", this.#realSetInterval);
-    Object.defineProperty(globalThis, "clearInterval", this.#realClearInterval);
-    Object.defineProperty(nodeTimers, "setInterval", this.#realTimersSetInterval);
-    Object.defineProperty(nodeTimers, "clearInterval", this.#realTimersClearInterval);
-    Object.defineProperty(nodeTimersPromises, "setInterval", this.#realPromisifiedSetInterval);
+    putDescriptor(globalThis, "setInterval", this.#realSetInterval);
+    putDescriptor(globalThis, "clearInterval", this.#realClearInterval);
+    putDescriptor(nodeTimers, "setInterval", this.#realTimersSetInterval);
+    putDescriptor(nodeTimers, "clearInterval", this.#realTimersClearInterval);
+    putDescriptor(nodeTimersPromises, "setInterval", this.#realPromisifiedSetInterval);
   }
 
   #restoreOriginalSchedulerWait() {
@@ -284,47 +297,49 @@ class MockTimers {
   }
 
   #restoreOriginalSetTimeout() {
-    Object.defineProperty(globalThis, "setTimeout", this.#realSetTimeout);
-    Object.defineProperty(globalThis, "clearTimeout", this.#realClearTimeout);
-    Object.defineProperty(nodeTimers, "setTimeout", this.#realTimersSetTimeout);
-    Object.defineProperty(nodeTimers, "clearTimeout", this.#realTimersClearTimeout);
-    Object.defineProperty(nodeTimersPromises, "setTimeout", this.#realPromisifiedSetTimeout);
+    putDescriptor(globalThis, "setTimeout", this.#realSetTimeout);
+    putDescriptor(globalThis, "clearTimeout", this.#realClearTimeout);
+    putDescriptor(nodeTimers, "setTimeout", this.#realTimersSetTimeout);
+    putDescriptor(nodeTimers, "clearTimeout", this.#realTimersClearTimeout);
+    putDescriptor(nodeTimersPromises, "setTimeout", this.#realPromisifiedSetTimeout);
   }
 
   #storeOriginalSetImmediate() {
-    this.#realSetImmediate = Object.getOwnPropertyDescriptor(globalThis, "setImmediate");
-    this.#realClearImmediate = Object.getOwnPropertyDescriptor(globalThis, "clearImmediate");
-    this.#realTimersSetImmediate = Object.getOwnPropertyDescriptor(nodeTimers, "setImmediate");
-    this.#realTimersClearImmediate = Object.getOwnPropertyDescriptor(nodeTimers, "clearImmediate");
-    this.#realPromisifiedSetImmediate = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setImmediate");
+    this.#realSetImmediate = takeDescriptor(globalThis, "setImmediate");
+    this.#realClearImmediate = takeDescriptor(globalThis, "clearImmediate");
+    this.#realTimersSetImmediate = takeDescriptor(nodeTimers, "setImmediate");
+    this.#realTimersClearImmediate = takeDescriptor(nodeTimers, "clearImmediate");
+    this.#realPromisifiedSetImmediate = takeDescriptor(nodeTimersPromises, "setImmediate");
   }
 
   #storeOriginalSetInterval() {
-    this.#realSetInterval = Object.getOwnPropertyDescriptor(globalThis, "setInterval");
-    this.#realClearInterval = Object.getOwnPropertyDescriptor(globalThis, "clearInterval");
-    this.#realTimersSetInterval = Object.getOwnPropertyDescriptor(nodeTimers, "setInterval");
-    this.#realTimersClearInterval = Object.getOwnPropertyDescriptor(nodeTimers, "clearInterval");
-    this.#realPromisifiedSetInterval = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setInterval");
+    this.#realSetInterval = takeDescriptor(globalThis, "setInterval");
+    this.#realClearInterval = takeDescriptor(globalThis, "clearInterval");
+    this.#realTimersSetInterval = takeDescriptor(nodeTimers, "setInterval");
+    this.#realTimersClearInterval = takeDescriptor(nodeTimers, "clearInterval");
+    this.#realPromisifiedSetInterval = takeDescriptor(nodeTimersPromises, "setInterval");
   }
 
   #storeOriginalSchedulerWait() {
+    // Listed until the file boundary: reset() writes a bound copy back, not this descriptor.
+    takeDescriptor(nodeTimersPromises.scheduler, "wait");
     this.#realTimersPromisifiedSchedulerWait = nodeTimersPromises.scheduler.wait.bind(this);
   }
 
   #storeOriginalSetTimeout() {
-    this.#realSetTimeout = Object.getOwnPropertyDescriptor(globalThis, "setTimeout");
-    this.#realClearTimeout = Object.getOwnPropertyDescriptor(globalThis, "clearTimeout");
-    this.#realTimersSetTimeout = Object.getOwnPropertyDescriptor(nodeTimers, "setTimeout");
-    this.#realTimersClearTimeout = Object.getOwnPropertyDescriptor(nodeTimers, "clearTimeout");
-    this.#realPromisifiedSetTimeout = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setTimeout");
+    this.#realSetTimeout = takeDescriptor(globalThis, "setTimeout");
+    this.#realClearTimeout = takeDescriptor(globalThis, "clearTimeout");
+    this.#realTimersSetTimeout = takeDescriptor(nodeTimers, "setTimeout");
+    this.#realTimersClearTimeout = takeDescriptor(nodeTimers, "clearTimeout");
+    this.#realPromisifiedSetTimeout = takeDescriptor(nodeTimersPromises, "setTimeout");
   }
 
   #storeOriginalAbortSignalTimeout() {
-    this.#realAbortSignalTimeout = Object.getOwnPropertyDescriptor(AbortSignal, "timeout");
+    this.#realAbortSignalTimeout = takeDescriptor(AbortSignal, "timeout");
   }
 
   #restoreOriginalAbortSignalTimeout() {
-    Object.defineProperty(AbortSignal, "timeout", this.#realAbortSignalTimeout);
+    putDescriptor(AbortSignal, "timeout", this.#realAbortSignalTimeout);
   }
 
   #createTimer(isInterval: boolean, callback: TimerCallback, delay: number, ...args: unknown[]) {
@@ -623,7 +638,7 @@ class MockTimers {
             this.#setImmediatePromisified.bind(this);
         },
         "Date": () => {
-          this.#nativeDateDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Date");
+          this.#nativeDateDescriptor = takeDescriptor(globalThis, "Date");
           (globalThis as { Date: unknown }).Date = this.#createDate();
         },
         "AbortSignal.timeout": () => {
@@ -661,7 +676,7 @@ class MockTimers {
           this.#restoreSetImmediate();
         },
         "Date": () => {
-          Object.defineProperty(globalThis, "Date", this.#nativeDateDescriptor);
+          putDescriptor(globalThis, "Date", this.#nativeDateDescriptor);
         },
         "AbortSignal.timeout": () => {
           this.#restoreOriginalAbortSignalTimeout();

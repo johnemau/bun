@@ -8,6 +8,7 @@
 
 const { jest } = Bun;
 const { kEmptyObject, throwNotImplemented } = require("internal/shared");
+const { trackMockedSlots, slotMocked, slotRestored, restoreMockedSlots } = require("internal/test_runner/mock_slots");
 const {
   validateBoolean,
   validateInteger,
@@ -927,6 +928,7 @@ class MockPropertyContext {
       },
       set: this.mockImplementation.bind(this),
     });
+    slotMocked(object, propertyName, descriptor);
   }
 
   get accesses() {
@@ -978,6 +980,7 @@ class MockPropertyContext {
       ...this.#descriptor,
       value: this.#originalValue,
     });
+    slotRestored(this.#object, this.#propertyName, this.#descriptor);
   }
 }
 
@@ -1009,24 +1012,25 @@ function createDefaultOriginal(): Function {
   return original;
 }
 
+let resetTrackerAtFileBoundary: (tracker: MockTracker) => void;
+
 class MockTracker {
   #mocks: { ctx: { restore: () => void } }[] = [];
   #timers: unknown;
-  // Set on the module-level tracker: registering into it from a new file's
-  // module scope must run the file-boundary reset (getRootNode) first.
-  #isFileScoped: boolean = false;
 
-  static createFileScoped(): MockTracker {
-    const tracker = new MockTracker();
-    tracker.#isFileScoped = true;
-    return tracker;
-  }
-
-  // File-scoped registrations must run the file-boundary reset (getRootNode)
-  // BEFORE capturing any state, or a new file's module-scope mock.method()
-  // would snapshot the previous file's still-installed mock as the original.
-  #syncEntryFile(): void {
-    if (this.#isFileScoped) getRootNode();
+  static {
+    // reset(), except that a restore that throws does not stop the rest: see onFileBoundary().
+    resetTrackerAtFileBoundary = function resetTrackerAtFileBoundary(tracker: MockTracker) {
+      for (const { ctx } of tracker.#mocks) {
+        try {
+          ctx.restore();
+        } catch {}
+      }
+      try {
+        (tracker.#timers as { reset: () => void } | undefined)?.reset();
+      } catch {}
+      tracker.#mocks = [];
+    };
   }
 
   #createMockFunction(
@@ -1073,7 +1077,7 @@ class MockTracker {
   }
 
   fn(original?: Function | object, implementation?: Function | object, options?: object) {
-    this.#syncEntryFile();
+    armFileBoundary();
     if (original !== null && original !== undefined && !$isCallable(original) && typeof original === "object") {
       options = implementation as object;
       implementation = original;
@@ -1113,7 +1117,7 @@ class MockTracker {
     implementation?: Function | object,
     options?: { getter?: boolean; setter?: boolean } | object,
   ) {
-    this.#syncEntryFile();
+    armFileBoundary();
     if (
       implementation !== null &&
       implementation !== undefined &&
@@ -1184,6 +1188,7 @@ class MockTracker {
     const restore = function restore() {
       // @ts-ignore
       Object.defineProperty(objectOrFunction, methodName, { __proto__: null, ...descriptor! });
+      slotRestored(objectOrFunction, methodName, descriptor!);
     };
     const mocked = this.#createMockFunction(original, implementation as Function | undefined, restore, times);
 
@@ -1206,6 +1211,7 @@ class MockTracker {
       mockDescriptor.writable = descriptor.writable;
     }
     Object.defineProperty(objectOrFunction, methodName, mockDescriptor);
+    slotMocked(objectOrFunction, methodName, descriptor);
     return mocked;
   }
 
@@ -1262,7 +1268,7 @@ class MockTracker {
   }
 
   property(object: object, propertyName: PropertyKey, value?: unknown) {
-    this.#syncEntryFile();
+    armFileBoundary();
     validateObject(object, "object");
     validateStringOrSymbol(propertyName, "propertyName");
 
@@ -1283,7 +1289,7 @@ class MockTracker {
   }
 
   get timers() {
-    this.#syncEntryFile();
+    armFileBoundary();
     if (this.#timers === undefined) {
       const { MockTimers } = require("internal/test_runner/mock_timers");
       this.#timers = new MockTimers();
@@ -1310,9 +1316,8 @@ class MockTracker {
   }
 }
 
-// The module-level tracker is reset automatically at each test-file boundary
-// (see getRootNode), matching Node's per-process module state.
-const mock = MockTracker.createFileScoped();
+// node makes this tracker once in each test file's process. Here onFileBoundary() resets it.
+const mock = new MockTracker();
 
 // -----------------------------------------------------------------------------
 // Assertions (t.assert + custom assertion registry)
@@ -1337,9 +1342,7 @@ let customAssertions: Record<string, Function> = { __proto__: null } as unknown 
 function registerCustomAssertion(name: string, fn: Function) {
   validateString(name, "name");
   validateFunction(fn, "fn");
-  // Run the file-boundary reset first so a registration made at module scope,
-  // before the file's first test, is not wiped by that test's registration.
-  getRootNode();
+  armFileBoundary();
   customAssertions[name] = fn;
 }
 
@@ -1654,38 +1657,49 @@ class TestNode {
   }
 }
 
-// Bumped by the runner's enter_file. Bound privately rather than read off the
-// bun:test module object, which is public API.
-const fileGeneration: () => number = $bindgen("jest.bind.ts", "fileGeneration");
+// Hands onFileBoundary() to `bun test`. False where no runner loads test files: outside
+// `bun test`, and in a Worker. Bound privately rather than read off the bun:test module
+// object, which is public API.
+const armFileBoundaryInRunner: (onFileBoundary: () => void) => boolean = $bindgen(
+  "jest.bind.ts",
+  "nodeTestArmFileBoundary",
+);
 // Overrides the running bun:test sequence result: `false` → skip, `true` → todo.
 // `done` binds the intended sequence so a late call after the bun:test watchdog
 // moved on cannot write onto the currently-running test.
 const markCurrentResult: (todo: boolean, done: Done) => void = $bindgen("jest.bind.ts", "nodeTestMarkResult");
 
 let rootNode: TestNode | undefined;
-let rootGeneration = -1;
+let fileBoundaryArmed = false;
+
+// Each API that gives a test file state of its own calls this before it makes any.
+function armFileBoundary() {
+  if (fileBoundaryArmed) return;
+  fileBoundaryArmed = true;
+  if (armFileBoundaryInRunner(onFileBoundary)) trackMockedSlots();
+}
+
+// `bun test` calls this before it loads a test file, if an earlier file of the run used this
+// module. node gives each test file a process, so there no state of this module, and no mock
+// a file left installed, reaches the next file. Nothing here may throw: a process that ends
+// cannot fail, and a mock.getter() on a stream cannot be restored in node either.
+function onFileBoundary() {
+  const oldRoot = rootNode;
+  // Not a new root: a root takes its file from Bun.main, which still names the file that ended.
+  rootNode = undefined;
+  // The root's own tracker is the `t.mock` of a file-level hook, not the module-level `mock`.
+  const rootTracker = oldRoot?.mockTracker;
+  if (rootTracker) resetTrackerAtFileBoundary(rootTracker);
+  resetTrackerAtFileBoundary(mock);
+  restoreMockedSlots();
+  customAssertions = { __proto__: null } as unknown as Record<string, Function>;
+  tagsExperimentalWarningEmitted = false;
+}
 
 function getRootNode(): TestNode {
-  // Fresh root on each runner enter_file (per file AND per --rerun-each
-  // iteration) so file-level hooks/state never leak between them; Bun.main
-  // alone can't detect a rerun of the same file.
-  const generation = fileGeneration();
-  if (rootNode === undefined || rootGeneration !== generation) {
-    const oldRoot = rootNode;
-    rootGeneration = generation;
-    // Publish the new root before resetting so re-entrant calls (user code run
-    // by a mock's restore) see an up-to-date root and don't reset again.
+  if (rootNode === undefined) {
+    armFileBoundary();
     rootNode = new TestNode(kRootName, undefined, kDefaultOptions, true, false);
-    if (oldRoot !== undefined) {
-      // Node also scopes these per process: drop the previous file's
-      // module-level mocks and assert.register() additions with its root.
-      // The root's own mockTracker (reachable via a file-level before hook's
-      // `t.mock`) is distinct from the module-level `mock` export.
-      oldRoot.mockTracker?.reset();
-      mock.reset();
-      customAssertions = { __proto__: null } as unknown as Record<string, Function>;
-      tagsExperimentalWarningEmitted = false;
-    }
   }
   return rootNode;
 }

@@ -2976,6 +2976,23 @@ impl TestCommand {
                 reporter.jest.snapshots.reset_counts();
             }
 
+            // node runs each `node:test` file in a process of its own. Here the file before
+            // shares this realm, so what it left is dropped before this file's first statement.
+            // It runs before `enter_file`, so an error it throws belongs to no file.
+            if let Some(on_file_boundary) = vm
+                .rare_data
+                .as_deref()
+                .and_then(|rare| rare.node_test_file_boundary.get())
+            {
+                vm.event_loop_ref().run_callback(
+                    bun_event_loop::ContextId::NONE,
+                    on_file_boundary,
+                    vm.global(),
+                    jsc::JSValue::UNDEFINED,
+                    &[],
+                );
+            }
+
             let bun_test_root = &mut jest::Jest::runner().unwrap().bun_test_root;
             // Determine if this file should run tests concurrently based on glob pattern
             let should_run_concurrent = reporter.jest.should_file_run_concurrently(file_id);

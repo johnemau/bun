@@ -6162,6 +6162,8 @@ impl VirtualMachine {
             // global makes the next file's call a no-op and dispatches
             // node:quic events into the dead realm.
             rare.node_quic_callbacks.deinit();
+            // The outgoing realm's `node:test` has no next file.
+            rare.node_test_file_boundary.deinit();
         }
         let _ = self.event_loop_mut().drain_microtasks();
 

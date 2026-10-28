@@ -428,10 +428,6 @@ pub(crate) struct BunTestRoot {
     /// so a never-settled promise's `+1` stays reachable; do not free orphans —
     /// a queued reaction may still consume them.
     pub(crate) pending_then_refs: std::cell::RefCell<Vec<*const RefData>>,
-    /// Monotonic per-`enter_file` counter. Exposed to JS so per-file module
-    /// state (node:test root) resets on `--rerun-each` where `Bun.main` is
-    /// unchanged across iterations.
-    pub(crate) file_generation: u32,
 }
 
 impl BunTestRoot {
@@ -450,7 +446,6 @@ impl BunTestRoot {
             active_file: None,
             hook_scope,
             pending_then_refs: std::cell::RefCell::new(Vec::new()),
-            file_generation: 0,
         }
     }
 
@@ -508,7 +503,6 @@ impl BunTestRoot {
         let _g = group_begin!();
 
         debug_assert!(self.active_file.is_none());
-        self.file_generation = self.file_generation.wrapping_add(1);
 
         // Derive the stored backref from the TestRunner's *stable* storage
         // (the global `Jest::RUNNER` NonNull) rather than `self as *mut _`.
