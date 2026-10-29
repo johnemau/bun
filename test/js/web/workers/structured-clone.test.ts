@@ -1,11 +1,12 @@
 import { deserialize, serialize } from "bun:jsc";
-import { openSync } from "fs";
-import { bunEnv, bunExe, tls } from "harness";
+import { closeSync, openSync, read } from "fs";
+import { bunEnv, bunExe, isGlibc, isWindows, tempDir, tls } from "harness";
 import { createPrivateKey, createPublicKey, createSecretKey, KeyObject, X509Certificate } from "node:crypto";
+import { once } from "node:events";
 import { BlockList } from "node:net";
 import type { ReadableStreamDefaultReader } from "node:stream/web";
 import { deserialize as v8Deserialize } from "node:v8";
-import { receiveMessageOnPort } from "node:worker_threads";
+import { Worker as NodeWorker, receiveMessageOnPort } from "node:worker_threads";
 import { deflate } from "node:zlib";
 import { join } from "path";
 
@@ -1159,6 +1160,436 @@ describe("options.transfer iterator results", () => {
     };
     const cloned = structuredClone(buffer, { transfer } as any);
     expect([cloned.byteLength, buffer.byteLength]).toEqual([4, 0]);
+  });
+});
+
+// Native code that reads or writes an ArrayBuffer pins it, and a transfer of a pinned buffer hands
+// out a copy ("A Bun-pinned ArrayBuffer copies on transfer instead of detaching" above). The copy
+// of a resizable buffer is resizable with the same maximum, as the buffer that a transfer moves
+// is: a length-tracking view has no length over anything else. Node detaches the pinned buffer.
+// Bun leaves it attached, and the read lands in it.
+describe("a resizable ArrayBuffer that is transferred while an fs.read into it is pending arrives resizable", () => {
+  const head = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const bytes = [...head, 13, 14, 15, 16];
+  const file = join(import.meta.dir, "example.txt");
+
+  const resizable = { maxByteLength: 64 };
+  const fixed = {};
+  function pinnedBuffer(options: { maxByteLength?: number } = resizable) {
+    const ab = new ArrayBuffer(16, options);
+    new Uint8Array(ab).set(bytes);
+    return { ab, pending: readInto(ab) };
+  }
+  // The read pins `ab` until its callback runs. It fills bytes 12 to 15, so the bytes in front
+  // of them do not depend on when it lands. Resolves to what the sender has after the read.
+  function readInto(ab: ArrayBuffer) {
+    const fd = openSync(file, "r");
+    const { promise, resolve, reject } = Promise.withResolvers<typeof sender>();
+    read(fd, new Uint8Array(ab), 12, 4, 0, err => {
+      closeSync(fd);
+      if (err) reject(err);
+      else resolve({ detached: ab.detached, byteLength: ab.byteLength, tail: Buffer.from(ab, 12, 4).toString() });
+    });
+    return promise;
+  }
+  const sender = { detached: false, byteLength: 16, tail: "exam" };
+  // The workers and the child processes below run it too: they get its source.
+  function shape(value: ArrayBuffer | ArrayBufferView) {
+    const buffer = value instanceof ArrayBuffer ? value : value.buffer;
+    return {
+      type: value.constructor.name,
+      byteLength: value.byteLength,
+      buffer: `${buffer.byteLength} of ${buffer.maxByteLength}${buffer.resizable ? ", resizable" : ""}`,
+      head: Array.from(new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 12))),
+    };
+  }
+  const tracking = { type: "Uint8Array", byteLength: 16, buffer: "16 of 64, resizable", head };
+
+  async function runChild(script: string, env: Record<string, string | undefined> = bunEnv) {
+    await using proc = Bun.spawn({ cmd: [bunExe(), "-e", script], env, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test.each([
+    ["the buffer", (ab: ArrayBuffer) => ab, { ...tracking, type: "ArrayBuffer" }, 64],
+    ["a length-tracking Uint8Array", (ab: ArrayBuffer) => new Uint8Array(ab), tracking, 64],
+    [
+      "a length-tracking Uint8Array at an offset",
+      (ab: ArrayBuffer) => new Uint8Array(ab, 4),
+      { ...tracking, byteLength: 12 },
+      60,
+    ],
+    ["a length-tracking DataView", (ab: ArrayBuffer) => new DataView(ab), { ...tracking, type: "DataView" }, 64],
+    ["a fixed-length Uint8Array", (ab: ArrayBuffer) => new Uint8Array(ab, 0, 8), { ...tracking, byteLength: 8 }, 8],
+  ] as const)("structuredClone() of %s", async (_, make, expected, byteLengthAfterResize) => {
+    const { ab, pending } = pinnedBuffer();
+    const clone = structuredClone(make(ab), { transfer: [ab] });
+    expect(shape(clone)).toEqual(expected);
+    (clone instanceof ArrayBuffer ? clone : clone.buffer).resize(64);
+    expect(clone.byteLength).toBe(byteLengthAfterResize);
+    expect(await pending).toEqual(sender);
+  });
+
+  test("with the length it has when the transfer happens", async () => {
+    const { ab, pending } = pinnedBuffer();
+    ab.resize(32);
+    const clone = structuredClone(new Uint8Array(ab), { transfer: [ab] });
+    expect(shape(clone)).toEqual({ ...tracking, byteLength: 32, buffer: "32 of 64, resizable" });
+    expect(await pending).toEqual({ ...sender, byteLength: 32 });
+  });
+
+  test("for each transfer while the read is pending, and it moves once the read is done", async () => {
+    const { ab, pending } = pinnedBuffer();
+    const first = structuredClone(new Uint8Array(ab), { transfer: [ab] });
+    const second = structuredClone(new Uint8Array(ab), { transfer: [ab] });
+    first[0] = 99;
+    expect([shape(first), shape(second)]).toEqual([{ ...tracking, head: [99, ...head.slice(1)] }, tracking]);
+    expect(await pending).toEqual(sender);
+    const moved = structuredClone(new Uint8Array(ab), { transfer: [ab] });
+    expect(shape(moved)).toEqual(tracking);
+    expect(ab.detached).toBe(true);
+  });
+
+  test("when a getter starts the read during serialization", async () => {
+    const ab = new ArrayBuffer(16, resizable);
+    new Uint8Array(ab).set(bytes);
+    let pending: ReturnType<typeof readInto> | undefined;
+    const value = {
+      get view() {
+        pending = readInto(ab);
+        return new Uint8Array(ab);
+      },
+    };
+    const clone = structuredClone(value, { transfer: [ab] });
+    expect(shape(clone.view)).toEqual(tracking);
+    expect(await pending).toEqual(sender);
+  });
+
+  // The message holds the buffers in the opposite order of the list.
+  test.each([
+    ["a pinned buffer, then a detachable one", ["pinned", "detachable"]],
+    ["a detachable buffer, then a pinned one", ["detachable", "pinned"]],
+    ["a detachable buffer between two pinned ones", ["pinned", "detachable", "pinned"]],
+  ] as const)("in a transfer list with %s", async (_, kinds) => {
+    const pending: ReturnType<typeof readInto>[] = [];
+    const buffers = kinds.map((kind, index) => {
+      const ab = new ArrayBuffer(16, { maxByteLength: 64 + index });
+      new Uint8Array(ab).fill(index + 1);
+      if (kind === "pinned") pending.push(readInto(ab));
+      return ab;
+    });
+    const views = buffers.map(ab => new Uint8Array(ab)).toReversed();
+    const clone: Uint8Array[] = structuredClone(views, { transfer: buffers }).toReversed();
+    expect(clone.map(view => ({ ...shape(view), head: view[0] }))).toEqual(
+      kinds.map((_, index) => ({ ...tracking, buffer: `16 of ${64 + index}, resizable`, head: index + 1 })),
+    );
+    await Promise.all(pending);
+    expect(buffers.map(ab => ab.detached)).toEqual(kinds.map(kind => kind === "detachable"));
+  });
+
+  test.each([
+    ["postMessage(message, [buffer])", (ab: ArrayBuffer) => [ab]],
+    ["postMessage(message, { transfer: [buffer] })", (ab: ArrayBuffer) => ({ transfer: [ab] })],
+  ] as const)("MessagePort#%s, and the next message arrives", async (_, transfer) => {
+    const { port1, port2 } = new MessageChannel();
+    const received: unknown[] = [];
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const receive = (entry: unknown) => received.push(entry) === 2 && resolve();
+    port2.onmessage = ({ data }) => receive(typeof data === "string" ? data : shape(data));
+    port2.onmessageerror = () => receive("messageerror");
+
+    const { ab, pending } = pinnedBuffer();
+    port1.postMessage(new Uint8Array(ab), transfer(ab) as any);
+    port1.postMessage("next");
+    await promise;
+    port1.close();
+    expect(received).toEqual([tracking, "next"]);
+    expect(await pending).toEqual(sender);
+  });
+
+  // In a process of its own: a message that cannot be read used to abort the process here.
+  test.concurrent("receiveMessageOnPort()", async () => {
+    const { stdout, stderr, exitCode } = await runChild(`
+      const { MessageChannel, receiveMessageOnPort } = require("node:worker_threads");
+      const fs = require("node:fs");
+      ${shape}
+      const { port1, port2 } = new MessageChannel();
+      const ab = new ArrayBuffer(16, { maxByteLength: 64 });
+      new Uint8Array(ab).set(${JSON.stringify(bytes)});
+      const fd = fs.openSync(${JSON.stringify(file)}, "r");
+      fs.read(fd, new Uint8Array(ab), 12, 4, 0, () => fs.closeSync(fd));
+      port1.postMessage(new Uint8Array(ab), [ab]);
+      console.log(JSON.stringify(shape(receiveMessageOnPort(port2).message)));
+    `);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual(tracking);
+    expect(exitCode).toBe(0);
+  });
+
+  async function messagesFrom(body: string, count: number, post?: (worker: Worker) => void) {
+    const url = URL.createObjectURL(new Blob([`${shape}\n${body}`]));
+    const worker = new Worker(url);
+    try {
+      const received: unknown[] = [];
+      const { promise, resolve, reject } = Promise.withResolvers<unknown[]>();
+      const receive = (entry: unknown) => received.push(entry) === count && resolve(received);
+      worker.onerror = event => reject(event.error ?? event.message ?? event);
+      worker.onmessage = ({ data }) => receive(ArrayBuffer.isView(data) ? shape(data) : data);
+      worker.onmessageerror = () => receive("messageerror");
+      post?.(worker);
+      return await promise;
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  test("Worker#postMessage(message, [buffer])", async () => {
+    let pending: ReturnType<typeof readInto> | undefined;
+    const received = await messagesFrom(
+      `
+        self.onmessage = event => self.postMessage(shape(event.data));
+        self.onmessageerror = () => self.postMessage("messageerror");
+      `,
+      1,
+      worker => {
+        const pinned = pinnedBuffer();
+        pending = pinned.pending;
+        worker.postMessage(new Uint8Array(pinned.ab), [pinned.ab]);
+      },
+    );
+    expect(received).toEqual([tracking]);
+    expect(await pending).toEqual(sender);
+  });
+
+  test("postMessage(message, [buffer]) in a worker", async () => {
+    const received = await messagesFrom(
+      `
+        import fs from "node:fs";
+        const ab = new ArrayBuffer(16, { maxByteLength: 64 });
+        new Uint8Array(ab).set(${JSON.stringify(bytes)});
+        const fd = fs.openSync(${JSON.stringify(file)}, "r");
+        fs.read(fd, new Uint8Array(ab), 12, 4, 0, () => {
+          fs.closeSync(fd);
+          self.postMessage({ detached: ab.detached, byteLength: ab.byteLength, tail: Buffer.from(ab, 12, 4).toString() });
+        });
+        self.postMessage(new Uint8Array(ab), [ab]);
+      `,
+      2,
+    );
+    expect(received).toEqual([tracking, sender]);
+  });
+
+  test("workerData with transferList", async () => {
+    const { ab, pending } = pinnedBuffer();
+    const worker = new NodeWorker(
+      `
+        ${shape}
+        const { parentPort, workerData } = require("node:worker_threads");
+        parentPort.postMessage(shape(workerData));
+      `,
+      { eval: true, workerData: new Uint8Array(ab), transferList: [ab] },
+    );
+    try {
+      const [message] = await once(worker, "message");
+      expect(message).toEqual(tracking);
+      expect(await pending).toEqual(sender);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  // transfer() resizes the copy. A copy that is not resizable made it throw a RangeError. The
+  // last three rows, over a fixed-length buffer, never needed a resizable copy.
+  test.each([
+    ["resizable.transfer()", resizable, (ab: ArrayBuffer) => ab.transfer(), "16 of 64, resizable"],
+    ["resizable.transfer(0)", resizable, (ab: ArrayBuffer) => ab.transfer(0), "0 of 64, resizable"],
+    ["resizable.transfer(8)", resizable, (ab: ArrayBuffer) => ab.transfer(8), "8 of 64, resizable"],
+    ["resizable.transfer(32)", resizable, (ab: ArrayBuffer) => ab.transfer(32), "32 of 64, resizable"],
+    ["resizable.transferToFixedLength()", resizable, (ab: ArrayBuffer) => ab.transferToFixedLength(), "16 of 16"],
+    ["resizable.transferToFixedLength(32)", resizable, (ab: ArrayBuffer) => ab.transferToFixedLength(32), "32 of 32"],
+    ["fixed.transfer(8)", fixed, (ab: ArrayBuffer) => ab.transfer(8), "8 of 8"],
+    ["fixed.transfer(32)", fixed, (ab: ArrayBuffer) => ab.transfer(32), "32 of 32"],
+    ["fixed.transferToFixedLength(32)", fixed, (ab: ArrayBuffer) => ab.transferToFixedLength(32), "32 of 32"],
+  ] as const)("%s returns a copy", async (_, options, transfer, buffer) => {
+    const { ab, pending } = pinnedBuffer(options);
+    const copy = transfer(ab);
+    const byteLength = Number.parseInt(buffer);
+    expect(shape(copy)).toEqual({ type: "ArrayBuffer", byteLength, buffer, head: head.slice(0, byteLength) });
+    expect(await pending).toEqual(sender);
+  });
+
+  test("resizable.transfer() past the maximum throws a RangeError", async () => {
+    const { ab, pending } = pinnedBuffer();
+    expect(() => ab.transfer(65)).toThrow(RangeError);
+    expect(await pending).toEqual(sender);
+  });
+
+  // Each copy reserves the maximum of the buffer. A copy that nothing holds gives that back.
+  test.concurrent("64 times over with a 4 GiB maximum, when nothing keeps the copies", async () => {
+    const { stdout, stderr, exitCode } = await runChild(`
+      const fs = require("node:fs");
+      const ab = new ArrayBuffer(16, { maxByteLength: 2 ** 32 });
+      const fd = fs.openSync(${JSON.stringify(file)}, "r");
+      fs.read(fd, new Uint8Array(ab), 12, 4, 0, () => fs.closeSync(fd));
+      let copies = 0;
+      for (let i = 0; i < 32; i++) {
+        copies += ab.transfer().resizable;
+        copies += structuredClone(ab, { transfer: [ab] }).resizable;
+      }
+      console.log(copies);
+    `);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("64\n");
+    expect(exitCode).toBe(0);
+  });
+
+  // A resizable buffer takes its pages from a budget of three times the memory of the machine,
+  // or from JSC's Gigacage in an ASAN build. The child fills both, and then frees a little.
+  test.concurrent.skipIf(isWindows)(
+    "or transfer() throws and leaves it as it is, and transferToFixedLength() needs no copy",
+    async () => {
+      const { stdout, stderr, exitCode } = await runChild(`
+        const fs = require("node:fs");
+        const fd = fs.openSync(${JSON.stringify(file)}, "r");
+        let pending = 2;
+        const pinned = maxByteLength => {
+          const ab = new ArrayBuffer(16, { maxByteLength });
+          fs.read(fd, new Uint8Array(ab), 12, 4, 0, () => --pending || fs.closeSync(fd));
+          return ab;
+        };
+        const large = pinned(2 ** 32);
+        const small = pinned(65536);
+        // Freed after the fill, one by one, and made in a frame that is gone by then. The first
+        // leaves a full Gigacage room for the small buffers below. The second is the room for 16
+        // copies of small, or for 32 in a Gigacage.
+        const toFree = (() => [
+          new ArrayBuffer(1024 * 1024),
+          new ArrayBuffer(1024 * 1024, { maxByteLength: 1024 * 1024 }),
+        ])();
+        const held = [];
+        for (let size = 2 ** 32; size >= 65536; size /= 2) {
+          try {
+            for (let i = 0; i < 4096; i++) held.push(new ArrayBuffer(size, { maxByteLength: size }));
+          } catch {}
+        }
+        toFree[0] = null;
+        Bun.gc(true);
+        const withoutRoom = [
+          () => large.transfer(),
+          () => large.transfer(8),
+          () => large.transfer(32),
+          () => large.transferToFixedLength(),
+          () => large.transferToFixedLength(32),
+        ].map(transfer => {
+          try {
+            return transfer().byteLength;
+          } catch (error) {
+            return error.name + ": " + error.message;
+          }
+        });
+        // The copies that nothing holds any more are collected to make the next one.
+        toFree[1] = null;
+        Bun.gc(true);
+        let withRoom = 0;
+        for (let i = 0; i < 32; i++) {
+          withRoom += small.transfer().resizable;
+          withRoom += structuredClone(small, { transfer: [small] }).resizable;
+        }
+        console.log(JSON.stringify({ withoutRoom, detached: large.detached, byteLength: large.byteLength, withRoom }));
+      `);
+      const failed = "RangeError: ArrayBuffer transfer failed";
+      // stderr isn't checked: a debug build has mimalloc report every allocation that fails.
+      expect(stdout ? JSON.parse(stdout) : { stderr, exitCode }).toEqual({
+        withoutRoom: [failed, failed, failed, 16, 32],
+        detached: false,
+        byteLength: 16,
+        withRoom: 64,
+      });
+      expect(exitCode).toBe(0);
+    },
+  );
+
+  // The pages past the length of a resizable buffer are a guard, and Linux refuses the
+  // mprotect() that sets it up to a process that has all the mappings it may have. The shim
+  // refuses the one of the copy, whose length nothing else in the process asks for.
+  const cc = Bun.which("cc") || Bun.which("gcc") || Bun.which("clang");
+  // bun-musl is statically linked: LD_PRELOAD cannot load the shim.
+  const canShim = isGlibc && !!cc;
+  let shimDir: ReturnType<typeof tempDir> | undefined;
+  beforeAll(async () => {
+    if (!canShim) return;
+    shimDir = tempDir("pinned-copy-without-guard", {
+      "shim.c": `
+        #define _GNU_SOURCE
+        #include <dlfcn.h>
+        #include <errno.h>
+        #include <stdlib.h>
+        #include <sys/mman.h>
+
+        int mprotect(void *address, size_t length, int protection) {
+          const char *refused = getenv("REFUSE_PROT_NONE_OF");
+          if (refused && protection == PROT_NONE && length == strtoul(refused, 0, 0)) {
+            errno = ENOMEM;
+            return -1;
+          }
+          return ((int (*)(void *, size_t, int)) dlsym(RTLD_NEXT, "mprotect"))(address, length, protection);
+        }
+      `,
+    });
+    await using compiler = Bun.spawn({
+      cmd: [cc!, "-shared", "-fPIC", "-o", "shim.so", "shim.c", "-ldl"],
+      cwd: String(shimDir),
+      env: bunEnv,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([compiler.stderr.text(), compiler.exited]);
+    if (exitCode !== 0) throw new Error(`compiling the shim failed: ${stderr}`);
+  });
+  afterAll(() => shimDir?.[Symbol.dispose]());
+
+  test.concurrent.skipIf(!canShim)("when the system refuses its guard pages", async () => {
+    // 77 pages of 64 KiB: the guard of a buffer of one page is 76 pages.
+    const maxByteLength = 77 * 65536;
+    const shim = join(String(shimDir), "shim.so");
+    const { stdout, stderr, exitCode } = await runChild(
+      `
+        const fs = require("node:fs");
+        ${shape}
+        const pin = ab => {
+          new Uint8Array(ab).set(${JSON.stringify(bytes)});
+          const fd = fs.openSync(${JSON.stringify(file)}, "r");
+          fs.read(fd, new Uint8Array(ab), 12, 4, 0, () => fs.closeSync(fd));
+        };
+        // Made with two pages and then shrunk, so that its own guard has another length.
+        const small = new ArrayBuffer(2 * 65536, { maxByteLength: ${maxByteLength} });
+        small.resize(16);
+        pin(small);
+        // It has no guard. Its copy gets one when transfer() shrinks the copy.
+        const full = new ArrayBuffer(${maxByteLength}, { maxByteLength: ${maxByteLength} });
+        pin(full);
+        console.log(JSON.stringify([
+          shape(structuredClone(new Uint8Array(small), { transfer: [small] })),
+          shape(small.transfer(2 * 65536)),
+          shape(full.transfer(16)),
+        ]));
+      `,
+      {
+        ...bunEnv,
+        LD_PRELOAD: bunEnv.LD_PRELOAD ? `${shim}:${bunEnv.LD_PRELOAD}` : shim,
+        REFUSE_PROT_NONE_OF: String(76 * 65536),
+      },
+    );
+    expect(stderr).toBe("");
+    const copy = { ...tracking, buffer: `16 of ${maxByteLength}, resizable` };
+    expect(JSON.parse(stdout)).toEqual([
+      copy,
+      { ...copy, type: "ArrayBuffer", byteLength: 2 * 65536, buffer: `${2 * 65536} of ${maxByteLength}, resizable` },
+      { ...copy, type: "ArrayBuffer" },
+    ]);
+    expect(exitCode).toBe(0);
   });
 });
 
