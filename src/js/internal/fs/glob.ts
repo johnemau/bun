@@ -4,7 +4,10 @@
 //   https://github.com/nodejs/node/commit/74dcdbb5f1d00cbe47d8ce95906bafc5e5991392
 // plus "fs: do not descend into symlinks for ** unless following symlinks" (v26.9.0):
 //   https://github.com/nodejs/node/commit/ab7f4c88b78da1351f6a5d21b99e5bbe3907ec61
-// backed by a vendored copy of minimatch (Node's deps/minimatch/index.js, ISC license):
+// plus "fs: apply nocase to literal glob exclude patterns" (v26.9.0):
+//   https://github.com/nodejs/node/commit/54a1311d9e32e22bb3c88fff316ad0c979b71296
+// That is the walker of v24.22.1. The one of v26.12.1 differs from it only by the `maxDepth` option.
+// It is backed by a vendored copy of minimatch (Node's deps/minimatch/index.js, ISC license):
 //   https://github.com/nodejs/node/blob/50c35fea9e64d50ab3bb5f359e8523de89d6c798/deps/minimatch/index.js
 // embedded below lazyMinimatch(); the vendored block is third-party and not edited but for types — the port above it follows bun's style.
 //
@@ -167,6 +170,11 @@ function createMatcher(pattern: string, options: MinimatchOptions = kEmptyObject
   };
   return new (lazyMinimatch().Minimatch)(pattern, opts);
 }
+
+// Exclude matching is a pure string comparison with no filesystem
+// lookups, so unlike include patterns, literal patterns must also
+// match case-insensitively on case-insensitive platforms.
+const kExcludeMatcherOptions: MinimatchOptions = { nocaseMagicOnly: false };
 
 function cloneSet(values: Set<string>) {
   const cloned = new Set<string>();
@@ -420,7 +428,7 @@ class Glob {
         // consistent comparison before instantiating matchers.
         const matchers: Minimatch[] = [];
         for (const pat of exclude) {
-          matchers.push(createMatcher(resolve(this.#root, pat)));
+          matchers.push(createMatcher(resolve(this.#root, pat), kExcludeMatcherOptions));
         }
         this.#isExcluded = makeMatchersExclude(matchers);
         this.#results.setup(this.#root, this.#isExcluded);
