@@ -2,6 +2,8 @@
 //   https://github.com/nodejs/node/blob/50c35fea9e64d50ab3bb5f359e8523de89d6c798/lib/internal/fs/glob.js
 // plus "fs: fix glob early return skipping sibling entries" (v26.8.0):
 //   https://github.com/nodejs/node/commit/74dcdbb5f1d00cbe47d8ce95906bafc5e5991392
+// plus "fs: do not descend into symlinks for ** unless following symlinks" (v26.9.0):
+//   https://github.com/nodejs/node/commit/ab7f4c88b78da1351f6a5d21b99e5bbe3907ec61
 // backed by a vendored copy of minimatch (Node's deps/minimatch/index.js, ISC license):
 //   https://github.com/nodejs/node/blob/50c35fea9e64d50ab3bb5f359e8523de89d6c798/deps/minimatch/index.js
 // embedded below lazyMinimatch(); the vendored block is third-party and not edited but for types — the port above it follows bun's style.
@@ -687,9 +689,9 @@ class Glob {
             // e.g **/b/c when entry is a/b - add c to potential patterns
             subPatterns.add(index + 2);
           }
-          if ((nextMatches || pattern.at(0) === ".") && (entryIsDirectory || entry.isSymbolicLink()) && !fromSymlink) {
+          if ((nextMatches || pattern.at(0) === ".") && entryIsDirectory && !fromSymlink) {
             // If pattern after ** matches, or pattern starts with "."
-            // and entry is a directory or symlink, add to potential patterns
+            // and entry is a directory, add to potential patterns
             subPatterns.add(nextIndex);
           }
 
@@ -907,9 +909,9 @@ class Glob {
             // e.g **/b/c when entry is a/b - add c to potential patterns
             subPatterns.add(index + 2);
           }
-          if ((nextMatches || pattern.at(0) === ".") && (entryIsDirectory || entry.isSymbolicLink()) && !fromSymlink) {
+          if ((nextMatches || pattern.at(0) === ".") && entryIsDirectory && !fromSymlink) {
             // If pattern after ** matches, or pattern starts with "."
-            // and entry is a directory or symlink, add to potential patterns
+            // and entry is a directory, add to potential patterns
             subPatterns.add(nextIndex);
           }
 
