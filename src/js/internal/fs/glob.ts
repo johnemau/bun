@@ -1,15 +1,17 @@
 // Port of Node.js lib/internal/fs/glob.js (v26.3.0):
 //   https://github.com/nodejs/node/blob/50c35fea9e64d50ab3bb5f359e8523de89d6c798/lib/internal/fs/glob.js
+// plus "fs: fix glob early return skipping sibling entries" (v26.8.0):
+//   https://github.com/nodejs/node/commit/74dcdbb5f1d00cbe47d8ce95906bafc5e5991392
 // backed by a vendored copy of minimatch (Node's deps/minimatch/index.js, ISC license):
 //   https://github.com/nodejs/node/blob/50c35fea9e64d50ab3bb5f359e8523de89d6c798/deps/minimatch/index.js
 // embedded below lazyMinimatch(); the vendored block is third-party and not edited but for types — the port above it follows bun's style.
 //
-// This is not backed by Bun.Glob: the vendored test-fs-glob.mjs (448 cases)
+// This is not backed by Bun.Glob: the vendored test-fs-glob.mjs
 // exercises minimatch-specific semantics — withFileTypes Dirents, the
 // exclude-array matching rules, symlink-walking and dotfile rules — that
-// Bun.Glob.scan does not implement (328/448 fail with the Bun.Glob-backed
-// version on main). Replace this with Bun.Glob once those gaps are closed
-// natively.
+// Bun.Glob.scan does not implement (328 of its 448 cases failed with the
+// Bun.Glob-backed version that this port replaced). Replace this with
+// Bun.Glob once those gaps are closed natively.
 const { validateObject, validateString, validateBoolean, validateArray } = require("internal/validators");
 const { join, resolve, basename, dirname, isAbsolute } = require("node:path");
 const { kEmptyObject } = require("internal/shared");
@@ -647,9 +649,6 @@ class Glob {
       const nSymlinks = new Set<number>();
       for (const index of pattern.indexes) {
         // For each child, check potential patterns
-        if (this.#cache.seen(entryPath, pattern, index) || this.#cache.seen(entryPath, pattern, index + 1)) {
-          return;
-        }
         const current = pattern.at(index);
         const nextIndex = index + 1;
         const next = pattern.at(nextIndex);
@@ -866,9 +865,6 @@ class Glob {
       const nSymlinks = new Set<number>();
       for (const index of pattern.indexes) {
         // For each child, check potential patterns
-        if (this.#cache.seen(entryPath, pattern, index) || this.#cache.seen(entryPath, pattern, index + 1)) {
-          return;
-        }
         const current = pattern.at(index);
         const nextIndex = index + 1;
         const next = pattern.at(nextIndex);
