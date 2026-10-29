@@ -523,18 +523,19 @@ test("mock.property/mock.method survive a polluted Object.prototype", async () =
 });
 
 // node runs each test file in a process of its own. `bun test` runs the files of a run in one
-// realm, so node:test puts back what a file left mocked before the next file is loaded.
+// realm, so node:test undoes the mocks that a file left before the next file is loaded.
 describe("node:test between the files of one run", () => {
   // A debug+ASAN `bun test` child takes several seconds, and most of these run at the same time.
   // The tests of the files get the same time.
   const timeout = 30_000;
 
   // Every fixture loads this first. `bun test` loads a module once for a run, so the files of a
-  // run share these objects, and mocked() compares with what the first file of the run found.
+  // run share these objects, and mocked() compares them with what the first file of the run found.
   const shared = `
     const path = require("node:path");
     const timers = require("node:timers");
     const timersPromises = require("node:timers/promises");
+    const { Writable } = require("node:stream");
 
     const target = {
       method() {
@@ -549,51 +550,72 @@ describe("node:test between the files of one run", () => {
       set accessor(value) {},
       property: "real",
     };
-
-    const slots = {
-      "target.method": [target, "method"],
-      "target.rootHookMethod": [target, "rootHookMethod"],
-      "target.accessor": [target, "accessor"],
-      "target.property": [target, "property"],
-      "path.basename": [path, "basename"],
-      "AbortSignal.timeout": [AbortSignal, "timeout"],
-      "Date": [globalThis, "Date"],
-      "scheduler.wait": [timersPromises.scheduler, "wait"],
-    };
-    for (const name of ["setTimeout", "setInterval", "setImmediate"]) {
-      const clear = name.replace("set", "clear");
-      slots[name] = [globalThis, name];
-      slots[clear] = [globalThis, clear];
-      slots["timers." + name] = [timers, name];
-      slots["timers." + clear] = [timers, clear];
-      slots["timers/promises." + name] = [timersPromises, name];
+    class Model {
+      static find() {
+        return "real";
+      }
     }
+    class User extends Model {}
 
-    const parts = descriptor => [descriptor?.value, descriptor?.get, descriptor?.set];
-    const held = name => parts(Object.getOwnPropertyDescriptor(...slots[name]));
-    const heldAtFirst = Object.fromEntries(Object.keys(slots).map(name => [name, held(name)]));
+    // Every own property of these, so a slot that a mock adds or replaces shows up by itself.
+    const watched = {
+      target,
+      Model,
+      User,
+      path,
+      timers,
+      "timers/promises": timersPromises,
+      scheduler: timersPromises.scheduler,
+      AbortSignal,
+    };
+    const globals = ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date"];
+
+    function held() {
+      const all = new Map();
+      const add = (name, object, key) => {
+        const { value, get, set } = Object.getOwnPropertyDescriptor(object, key);
+        all.set(name, [value, get, set]);
+      };
+      for (const [name, object] of Object.entries(watched)) {
+        for (const key of Reflect.ownKeys(object)) add(name + "." + String(key), object, key);
+      }
+      for (const key of globals) add(key, globalThis, key);
+      return all;
+    }
+    const heldAtFirst = held();
 
     module.exports = {
       target,
-      // A bare mock.fn() that a file leaves here.
+      Model,
+      User,
+      // What a file leaves here: a bare mock.fn(), one of a file-level hook, and a stream with a mocked getter.
       spy: undefined,
+      rootSpy: undefined,
+      stream: new Writable(),
       // The names of what does not hold the function or the value that it held at first.
       mocked() {
-        const names = Object.keys(slots).filter(name => held(name).some((part, i) => part !== heldAtFirst[name][i]));
+        const now = held();
+        const names = [];
+        for (const name of new Set([...heldAtFirst.keys(), ...now.keys()])) {
+          const [first, current] = [heldAtFirst.get(name), now.get(name)];
+          if (!first || !current || first.some((part, i) => part !== current[i])) names.push(name);
+        }
         if (this.spy !== undefined && this.spy() !== "original") names.push("mock.fn");
+        if (this.rootSpy !== undefined && this.rootSpy() !== "original") names.push("t.mock.fn of a file-level hook");
+        if (this.stream.destroyed !== false) names.push("stream.destroyed");
         return names.sort();
       },
     };
   `;
 
   // A file that looks at what the file before it left, before it touches the test module.
-  const follower = (label: string, testModule: "node:test" | "bun:test" = "node:test") => `
+  const follower = (label: string, testModule: "node:test" | "bun:test" = "node:test", options = "") => `
     const shared = require("./shared.js");
     const atLoad = shared.mocked();
     const { test } = require("${testModule}");
     const assert = require("node:assert");
-    test("${label}: nothing is mocked when the file loads", () => assert.deepStrictEqual(atLoad, []));
-    test("${label}: nothing is mocked in a test", () => assert.deepStrictEqual(shared.mocked(), []));
+    test("${label}: nothing is mocked when the file loads", ${options}() => assert.deepStrictEqual(atLoad, []));
+    test("${label}: nothing is mocked in a test", ${options}() => assert.deepStrictEqual(shared.mocked(), []));
   `;
   const nothingIsMocked = (label: string) => [
     `(pass) ${label}: nothing is mocked when the file loads`,
@@ -602,7 +624,7 @@ describe("node:test between the files of one run", () => {
 
   // Mocks made on top of mocks. As in node, each mock writes back what it found, so undoing them
   // first mock first does not put the real function back.
-  const mocksOnMocks = (afterHook: string) => `
+  const mocksOnMocks = (moreMocks: string, afterHook: string) => `
     const shared = require("./shared.js");
     const { test, mock, beforeEach, after } = require("node:test");
     const assert = require("node:assert");
@@ -613,14 +635,18 @@ describe("node:test between the files of one run", () => {
     beforeEach(() => {
       mock.method(path, "basename", () => "mocked " + ++count);
     });
+    // A mock for every class. A test mocks the method again, in a class that inherits it.
+    mock.method(shared.Model, "find", () => "mocked");
+    ${moreMocks}
 
     test("a module-level mock over the mock of a test", t => {
       assert.strictEqual(path.basename("/x/y"), "mocked 1");
       // The end of the test restores the mocks of the test. The module-level ones found those.
       t.mock.method(shared.target, "method", () => "of the test");
       mock.method(shared.target, "method", () => "module-level");
-      t.mock.timers.enable({ apis: ["setTimeout"] });
-      mock.timers.enable({ apis: ["setTimeout"] });
+      t.mock.method(shared.User, "find", () => "of the test");
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "setImmediate", "AbortSignal.timeout", "scheduler.wait"] });
+      mock.timers.enable({ apis: ["setTimeout", "setInterval", "setImmediate", "AbortSignal.timeout", "scheduler.wait"] });
     });
 
     test("a slot that is mocked twice", () => {
@@ -646,7 +672,7 @@ describe("node:test between the files of one run", () => {
       .map(line => line.replace(/ \[[\d.]+ms\]$/, ""));
     // What the files printed: the first line of stdout is the version of `bun test`.
     const printed = stdout.split(/\r?\n/).filter(line => line !== "" && !line.startsWith("bun test v"));
-    return { tests, printed, stderr, exitCode, signalCode: proc.signalCode };
+    return { tests, printed, stderr, exitCode, signalCode: proc.signalCode, pid: proc.pid };
   }
 
   // Not one of the concurrent tests below: a time limit is what tells it that the second file hangs.
@@ -733,6 +759,10 @@ describe("node:test between the files of one run", () => {
             // The tracker of the file itself, not the module-level one.
             before(t => {
               t.mock.method(shared.target, "rootHookMethod", () => "mocked");
+              shared.rootSpy = t.mock.fn(
+                () => "original",
+                () => "mocked",
+              );
             });
 
             test("leaves every kind of mock installed", () => {
@@ -749,6 +779,7 @@ describe("node:test between the files of one run", () => {
                 "setImmediate",
                 "setInterval",
                 "setTimeout",
+                "t.mock.fn of a file-level hook",
                 "target.accessor",
                 "target.method",
                 "target.property",
@@ -784,7 +815,12 @@ describe("node:test between the files of one run", () => {
       async () => {
         using dir = tempDir("node-test-files-stacked", {
           "shared.js": shared,
-          "mocks-on-mocks.js": mocksOnMocks(""),
+          "mocks-on-mocks.js": mocksOnMocks(
+            // The second mock goes through the proxy that the first one returns. In node too,
+            // mock.reset() throws for these two.
+            `mock.property(mock.property(shared.target, "property", "mocked"), "property", "mocked twice");`,
+            "",
+          ),
           "follower.js": follower("bun:test file", "bun:test"),
         });
         const { tests, exitCode, stderr } = await runFiles(String(dir), ["mocks-on-mocks.js", "follower.js"]);
@@ -801,24 +837,40 @@ describe("node:test between the files of one run", () => {
     );
 
     test(
-      "the first mock of each slot, which mock.reset() leaves as in node, is gone when the next file loads",
+      "the earlier mock of each slot, which mock.reset() leaves as in node, is gone when the next file loads",
       async () => {
         using dir = tempDir("node-test-files-stacked-reset", {
           "shared.js": shared,
-          "mocks-on-mocks.js": mocksOnMocks(`
+          "mocks-on-mocks.js": mocksOnMocks(
+            "",
+            `
             after(() => {
               mock.reset();
               assert.deepStrictEqual(shared.mocked(), [
+                "AbortSignal.timeout",
+                "User.find",
+                "clearImmediate",
+                "clearInterval",
                 "clearTimeout",
                 "path.basename",
+                "scheduler.wait",
+                "setImmediate",
+                "setInterval",
                 "setTimeout",
                 "target.method",
+                "timers.clearImmediate",
+                "timers.clearInterval",
                 "timers.clearTimeout",
+                "timers.setImmediate",
+                "timers.setInterval",
                 "timers.setTimeout",
+                "timers/promises.setImmediate",
+                "timers/promises.setInterval",
                 "timers/promises.setTimeout",
               ]);
             });
-          `),
+          `,
+          ),
           "follower.js": follower("next file"),
         });
         const { tests, exitCode, stderr } = await runFiles(String(dir), ["mocks-on-mocks.js", "follower.js"]);
@@ -835,26 +887,24 @@ describe("node:test between the files of one run", () => {
     );
 
     test(
-      "a mock that cannot be restored fails nothing, and the mocks after it are gone when the next file loads",
+      "a mock that cannot be restored calls the original, and the mocks after it are gone, when the next file loads",
       async () => {
         using dir = tempDir("node-test-files-unrestorable", {
           "shared.js": shared,
           "leaves-unrestorable.js": `
-            require("./shared.js");
+            const shared = require("./shared.js");
             const { test, mock } = require("node:test");
             const assert = require("node:assert");
             const path = require("node:path");
-            const { Writable } = require("node:stream");
 
             // "destroyed" is an accessor of Writable.prototype that is not configurable. The mock gives
             // the stream a copy that is not configurable either, so nothing can put the first one back.
-            const stream = new Writable();
-            mock.getter(stream, "destroyed", () => true);
+            mock.getter(shared.stream, "destroyed", () => true);
             mock.method(path, "basename", () => "mocked");
 
             test("leaves a mock that cannot be restored, and one made after it", () => {
               assert.throws(() => mock.restoreAll(), TypeError);
-              assert.strictEqual(stream.destroyed, true);
+              assert.strictEqual(shared.stream.destroyed, true);
               assert.strictEqual(path.basename("/x/y"), "mocked");
             });
           `,
@@ -865,6 +915,41 @@ describe("node:test between the files of one run", () => {
           tests: [
             "(pass) leaves a mock that cannot be restored, and one made after it",
             ...nothingIsMocked("next file"),
+          ],
+          exitCode: 0,
+          errors: null,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "mock timers whose reset throws do not stay enabled for the next file",
+      async () => {
+        using dir = tempDir("node-test-files-timers-throw", {
+          "pins-date.js": `
+            const { test, mock } = require("node:test");
+            mock.timers.enable({ apis: ["setTimeout", "Date"] });
+            // The reset cannot give Date the descriptor it had, and throws.
+            Object.defineProperty(globalThis, "Date", { configurable: false });
+            test("leaves mock timers whose reset throws", () => {});
+          `,
+          "enables-again.js": `
+            const atLoad = setTimeout.name;
+            const { test, mock } = require("node:test");
+            const assert = require("node:assert");
+            test("the next file has the real setTimeout and can mock timers", () => {
+              assert.strictEqual(atLoad, "setTimeout");
+              mock.timers.enable({ apis: ["setTimeout"] });
+              mock.timers.reset();
+            });
+          `,
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["pins-date.js", "enables-again.js"]);
+        expect({ tests, exitCode, errors: stderr.match(/^ *\d+ errors?$/m) }, stderr).toEqual({
+          tests: [
+            "(pass) leaves mock timers whose reset throws",
+            "(pass) the next file has the real setTimeout and can mock timers",
           ],
           exitCode: 0,
           errors: null,
@@ -921,19 +1006,74 @@ describe("node:test between the files of one run", () => {
       timeout,
     );
 
-    // The second file is loaded in the same realm for each of these.
+    test(
+      "mocks of a test that never ends, and of the context of a test that is over, are gone when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-no-reset", {
+          "shared.js": shared,
+          "nothing-resets-these.js": `
+            const shared = require("./shared.js");
+            const { test } = require("node:test");
+            const path = require("node:path");
+
+            let kept;
+            test("keeps its context", { timeout: ${timeout} }, t => {
+              kept = t;
+            });
+            // node:test resets the mocks of a test when the test ends. This one is over.
+            test("mocks through the context of a test that is over", { timeout: ${timeout} }, () => {
+              kept.mock.method(path, "basename", () => "mocked");
+              kept.mock.timers.enable({ apis: ["setInterval"] });
+            });
+            // The timeout of bun test ends this one, so node:test never gets to reset its mocks.
+            test("never ends", async t => {
+              t.mock.method(shared.target, "method", () => "mocked");
+              t.mock.timers.enable({ apis: ["setTimeout"] });
+              await new Promise(() => {});
+            });
+          `,
+          "follower.js": follower("next file", "node:test", `{ timeout: ${timeout} }, `),
+        });
+        const { tests, exitCode, stderr } = await runFiles(
+          String(dir),
+          ["nothing-resets-these.js", "follower.js"],
+          ["--timeout", "300"],
+        );
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: [
+            "(pass) keeps its context",
+            "(pass) mocks through the context of a test that is over",
+            "(fail) never ends",
+            ...nothingIsMocked("next file"),
+          ],
+          exitCode: 1,
+        });
+      },
+      timeout,
+    );
+
+    // A file is loaded again, or after another one, in the realm that the file before it used.
+    // `--parallel` starts a second worker only after the delay, so one worker loads every file.
     test.each([
-      ["--rerun-each", ["--rerun-each=3"], ["again.mjs"], 3],
-      ["a --parallel worker with --no-isolate", ["--parallel=1", "--no-isolate"], ["again.mjs", "again-2.mjs"], 2],
+      ["--rerun-each", ["--rerun-each=3"], 1, 3, false],
+      ["--isolate with --rerun-each", ["--isolate", "--rerun-each=3"], 2, 6, false],
+      [
+        "a --parallel worker with --no-isolate",
+        ["--parallel=2", "--parallel-delay=1000000", "--no-isolate"],
+        3,
+        3,
+        true,
+      ],
     ] as const)(
       "mocks that a file leaves are gone when %s loads a file",
-      async (_, args, files, runs) => {
+      async (_, args, files, runs, inWorker) => {
         const again = `
           import { test, mock } from "node:test";
           import assert from "node:assert";
           import path from "node:path";
           import shared from "./shared.js";
 
+          console.log("pid " + process.pid);
           const atLoad = shared.mocked();
           test("nothing is mocked when the file loads", () => {
             assert.deepStrictEqual(atLoad, []);
@@ -943,19 +1083,28 @@ describe("node:test between the files of one run", () => {
         `;
         using dir = tempDir("node-test-files-again", {
           "shared.js": shared,
-          "again.mjs": again,
+          "again-1.mjs": again,
           "again-2.mjs": again,
+          "again-3.mjs": again,
         });
-        const { tests, exitCode, stderr } = await runFiles(String(dir), [...files], [...args]);
-        expect({ tests, exitCode }, stderr).toEqual({
+        const { tests, exitCode, stderr, printed, pid } = await runFiles(
+          String(dir),
+          ["again-1.mjs", "again-2.mjs", "again-3.mjs"].slice(0, files),
+          [...args],
+        );
+        // A worker prints through the stderr of `bun test`.
+        const pids = new Set([...printed, ...stderr.split(/\r?\n/)].filter(line => /^pid \d+$/.test(line)));
+        expect({ tests, exitCode, processes: pids.size, inWorker: !pids.has("pid " + pid) }, stderr).toEqual({
           tests: Array(runs).fill("(pass) nothing is mocked when the file loads"),
           exitCode: 0,
+          processes: 1,
+          inWorker,
         });
       },
       timeout,
     );
 
-    // Each write to the property prints a line: one for the mock, and one if node:test restores it.
+    // Each write to the property prints a line: two for the two mocks, and one for each restore.
     const mocksAProxy = {
       "mocks-a-proxy.js": `
         const { test, mock } = require("node:test");
@@ -969,11 +1118,19 @@ describe("node:test between the files of one run", () => {
           },
         );
         mock.method(target, "method", () => {});
-        test("leaves a mock on a proxy", () => {});
+        mock.method(target, "method", () => {});
+        test("leaves two mocks on a proxy", () => {});
       `,
       "next-file.js": `
         console.log("the next file loads");
-        require("node:test").test("the next file", () => {});
+        const { test, mock } = require("node:test");
+        mock.restoreAll();
+        console.log("the next file called mock.restoreAll()");
+        test("the next file", () => {});
+      `,
+      "third-file.js": `
+        console.log("the third file loads");
+        require("node:test").test("the third file", () => {});
       `,
     };
 
@@ -981,9 +1138,16 @@ describe("node:test between the files of one run", () => {
       "what a file leaves is restored once, before the first statement of the next file",
       async () => {
         using dir = tempDir("node-test-files-once", mocksAProxy);
-        const { printed, exitCode, stderr } = await runFiles(String(dir), ["mocks-a-proxy.js", "next-file.js"]);
+        const { printed, exitCode, stderr } = await runFiles(String(dir), Object.keys(mocksAProxy));
         expect({ printed, exitCode }, stderr).toEqual({
-          printed: ["defineProperty method", "defineProperty method", "the next file loads"],
+          printed: [
+            "defineProperty method",
+            "defineProperty method",
+            "defineProperty method",
+            "the next file loads",
+            "the next file called mock.restoreAll()",
+            "the third file loads",
+          ],
           exitCode: 0,
         });
       },
@@ -994,13 +1158,15 @@ describe("node:test between the files of one run", () => {
       "nothing is restored in the realm that --isolate leaves",
       async () => {
         using dir = tempDir("node-test-files-isolate", mocksAProxy);
-        const { printed, exitCode, stderr } = await runFiles(
-          String(dir),
-          ["mocks-a-proxy.js", "next-file.js"],
-          ["--isolate"],
-        );
+        const { printed, exitCode, stderr } = await runFiles(String(dir), Object.keys(mocksAProxy), ["--isolate"]);
         expect({ printed, exitCode }, stderr).toEqual({
-          printed: ["defineProperty method", "the next file loads"],
+          printed: [
+            "defineProperty method",
+            "defineProperty method",
+            "the next file loads",
+            "the next file called mock.restoreAll()",
+            "the third file loads",
+          ],
           exitCode: 0,
         });
       },
@@ -1021,6 +1187,84 @@ describe("node:test between the files of one run", () => {
         });
         const { printed, exitCode, stderr } = await runFiles(String(dir), ["only-file.js"]);
         expect({ printed, exitCode }, stderr).toEqual({ printed: ["at exit: mocked"], exitCode: 0 });
+      },
+      timeout,
+    );
+
+    test(
+      "a spy of bun:test that bun:test restored is not put back when the next file loads",
+      async () => {
+        using dir = tempDir("node-test-files-bun-test-spy", {
+          // A common setup file: no console.error in a test, and the real one again after each test.
+          "setup.ts": `
+            import { afterEach, beforeEach, mock, spyOn } from "bun:test";
+            beforeEach(() => {
+              spyOn(console, "error").mockImplementation(() => {});
+            });
+            afterEach(() => {
+              mock.restore();
+            });
+          `,
+          // Its mock finds the spy of the setup file, and bun:test restores that spy over it.
+          "mocks-over-the-spy.mjs": `
+            import { test, mock } from "node:test";
+            import assert from "node:assert";
+            test("mocks console.error over the spy", () => {
+              const error = mock.method(console, "error", () => {});
+              console.error("no output");
+              assert.strictEqual(error.mock.callCount(), 1);
+            });
+          `,
+          "bun-test-file.ts": `
+            import { expect, test } from "bun:test";
+            const atLoad = console.error;
+            test("console.error is not a mock when the file loads", () => {
+              expect("mockRestore" in atLoad).toBe(false);
+            });
+          `,
+        });
+        const { tests, exitCode, stderr } = await runFiles(
+          String(dir),
+          ["mocks-over-the-spy.mjs", "bun-test-file.ts"],
+          ["--preload", "./setup.ts"],
+        );
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: ["(pass) mocks console.error over the spy", "(pass) console.error is not a mock when the file loads"],
+          exitCode: 0,
+        });
+      },
+      timeout,
+    );
+
+    test(
+      "a callback of the file before, when it runs in the next file, finds the real function",
+      async () => {
+        using dir = tempDir("node-test-files-late-callback", {
+          "shared.js": shared,
+          "leaves-a-callback.js": `
+            const shared = require("./shared.js");
+            const { test, mock } = require("node:test");
+            mock.method(shared.target, "method", () => "mocked");
+            globalThis.gate = Promise.withResolvers();
+            globalThis.late = globalThis.gate.promise.then(() => shared.target.method());
+            test("leaves a callback that waits for the next file", () => {});
+          `,
+          "opens-the-gate.js": `
+            const { test, expect } = require("bun:test");
+            test("the callback of the file before finds the real function", async () => {
+              globalThis.gate.resolve();
+              expect(await globalThis.late).toBe("real");
+            });
+          `,
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["leaves-a-callback.js", "opens-the-gate.js"]);
+        expect({ tests, exitCode }, stderr).toEqual({
+          tests: [
+            "(pass) leaves a callback that waits for the next file",
+            "(pass) the callback of the file before finds the real function",
+          ],
+          exitCode: 0,
+        });
       },
       timeout,
     );
