@@ -518,6 +518,7 @@ async function runOneFile(
     // loop is still suspended on I/O, before the finally's .catch attaches.
     drainStderr.catch(() => {});
 
+    let suiteFailed = false;
     const handleStdoutLine = (line: string) => {
       if (line.length === 0) return;
       // bun:test's own reporter can leave an unterminated line, so the marker is
@@ -540,7 +541,7 @@ async function runOneFile(
         return;
       }
       if (event == null || typeof event.data !== "object" || event.data === null) return;
-      republishChildEvent(event, absolute, reporter, fileCounts);
+      if (republishChildEvent(event, absolute, reporter, fileCounts)) suiteFailed = true;
     };
 
     const decoder = new TextDecoder();
@@ -562,7 +563,7 @@ async function runOneFile(
     // A nonzero exit with no child-reported failures means the file itself died
     // (top-level throw); child-reported failures are already covered by the
     // republished events and need no file-level verdict.
-    const fileFailed = exitCode !== 0 && fileCounts.failed === 0;
+    const fileFailed = exitCode !== 0 && fileCounts.failed === 0 && !suiteFailed;
     const fileDuration = Date.now() - fileStarted;
     // Node's FileTest.#skipReporting(): no file-level complete/pass/fail when
     // the child reported at least one test and the only error is subtestsFailed
@@ -631,12 +632,13 @@ function rebuildError(serialized: any, depth = 0): Error {
   return error;
 }
 
+// Returns true for the failure of a suite that is not todo: Node counts it, but not in `counts.failed`.
 function republishChildEvent(
   event: { type: string; data: any },
   file: string,
   reporter: TestsStream,
   counts: Record<string, number>,
-) {
+): boolean {
   const { type, data } = event;
   Object.setPrototypeOf(data, null);
   data.file = file;
@@ -669,11 +671,15 @@ function republishChildEvent(
     delete data.error;
     delete data.duration_ms;
     delete data.type;
-    if (type === "test:pass") reporter.pass(data);
-    else reporter.fail(data);
-    return;
+    if (type === "test:pass") {
+      reporter.pass(data);
+      return false;
+    }
+    reporter.fail(data);
+    return isSuite && !data.todo;
   }
   reporter.republish(type, data);
+  return false;
 }
 
 // Child side: with kRunChildEnv set, stream one JSON event per line so the
@@ -2185,7 +2191,7 @@ function createStopController(timeout: number | undefined) {
   });
   // Swallow the rejection when nothing is racing it anymore.
   promise.catch(() => {});
-  return { promise, dispose: () => realClearTimeout(timer) };
+  return { promise, deadline: performance.now() + timeout, dispose: () => realClearTimeout(timer) };
 }
 
 // Runs `run` racing Node's test timeout; the timer starts before the body so a
@@ -2318,11 +2324,14 @@ async function executeTestNode(node: TestNode, fn: TestFn): Promise<unknown> {
     failure = err;
   }
 
+  // When the test's own timeout ends. A wait for queued subtests below ends then too.
+  let deadline = Infinity;
   if (failure === undefined) {
     // Node arms one stopPromise (timeout + signal) and races both the body
     // AND the plan wait against it. Arm timeout once here so plan({wait:true})
     // is bounded by the same test timeout, not left unbounded.
     const stop = createStopController(node.options.timeout);
+    if (stop !== undefined) deadline = stop.deadline;
     try {
       const runBody = async () => {
         await runWithNode(node, () => invokeTestFn(fn, ctx));
@@ -2373,7 +2382,7 @@ async function executeTestNode(node: TestNode, fn: TestFn): Promise<unknown> {
 
   // Only a queued subtest can still fail the run, and a body that threw did not wait for it. Node cancels it instead.
   if ((acceptedXfail || failure !== undefined) && mustSettleSubtests(node, acceptedXfail)) {
-    await settleCountableSubtests(node);
+    await settleCountableSubtests(node, deadline - performance.now());
   }
 
   // Node sets passed/error before running afterEach/after so hooks can
@@ -2414,7 +2423,7 @@ async function executeTestNode(node: TestNode, fn: TestFn): Promise<unknown> {
 
   // A hook, or a subtest that is still queued, can call this test's t.skip() or t.todo() after the body failed.
   if ((acceptedXfail || failure !== undefined) && mustSettleSubtests(node, acceptedXfail)) {
-    await settleCountableSubtests(node);
+    await settleCountableSubtests(node, deadline - performance.now());
   }
 
   // Node's postRun() fold: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/test_runner/test.js#L1498-L1503
@@ -2475,8 +2484,18 @@ function mustSettleSubtests(node: TestNode, acceptedXfail: boolean) {
   return node.countableTail !== undefined && (acceptedXfail || node.skipped || node.todoFlag);
 }
 
+// Waits for the queued subtests that Node could count, for `timeout` ms at most: the time that the test has left.
+async function settleCountableSubtests(node: TestNode, timeout: number | undefined) {
+  try {
+    await raceWithTimeoutAndSignal(() => awaitCountableTail(node), timeout, undefined);
+  } catch {
+    // The timeout of the test is over. Node cancels what is still queued, so it no longer counts here.
+    node.countableTail = undefined;
+  }
+}
+
 // Awaits the queued subtests that Node could count, including ones queued while waiting.
-async function settleCountableSubtests(node: TestNode) {
+async function awaitCountableTail(node: TestNode) {
   let tail;
   do {
     tail = node.countableTail;
@@ -2615,7 +2634,8 @@ function createTopLevelTestRunner(node: TestNode, fn: TestFn) {
       failure => {
         // A queued subtest can call this test's t.skip() or t.todo() after executeTestNode() read them.
         if (failure !== undefined && mustSettleSubtests(node, false)) {
-          settleCountableSubtests(node).then(() => deliverEntryResult(node, failure, todoBefore, done));
+          const deliver = () => deliverEntryResult(node, failure, todoBefore, done);
+          settleCountableSubtests(node, node.options.timeout).then(deliver);
         } else {
           deliverEntryResult(node, failure, todoBefore, done);
         }
