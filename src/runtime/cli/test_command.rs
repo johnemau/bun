@@ -2978,20 +2978,25 @@ impl TestCommand {
 
             // node runs each `node:test` file in a process of its own. Here the file before
             // shares this realm, so `node:test` undoes the mocks it left before this file's
-            // first statement. No file is entered yet: what the call throws or rejects is
-            // reported here, and not counted against the file that is about to load.
+            // first statement. It runs before `enter_file`: an error or a rejection that it
+            // reports then does not end the collection of this file's tests.
             if let Some(on_file_boundary) = vm
                 .rare_data
                 .as_deref()
                 .and_then(|rare| rare.node_test_file_boundary.get())
             {
-                vm.event_loop_ref().run_callback(
+                let result = vm.event_loop_ref().run_callback_with_result(
                     bun_event_loop::ContextId::NONE,
                     on_file_boundary,
                     vm.global(),
                     jsc::JSValue::UNDEFINED,
                     &[],
                 );
+                // It undoes mocks without an error of its own. One that it throws is printed,
+                // and the run must not pass with it.
+                if result.is_empty() {
+                    reporter.jest.unhandled_errors_between_tests += 1;
+                }
                 let _ = vm.global().handle_rejected_promises();
             }
 

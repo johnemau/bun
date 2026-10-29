@@ -1031,7 +1031,7 @@ class MockTracker {
   #timers: unknown;
 
   static {
-    // reset() without the name lookups, for onFileBoundary().
+    // reset() for onFileBoundary(), without the methods and the iterator that a test file can replace.
     resetTrackerAtFileBoundary = function resetTrackerAtFileBoundary(tracker: MockTracker) {
       const mocks = tracker.#mocks;
       tracker.#mocks = [];

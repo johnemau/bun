@@ -1052,6 +1052,33 @@ describe("node:test between the files of one run", () => {
       timeout,
     );
 
+    test(
+      "an error that node:test throws between two files fails the run, and the next file runs its tests",
+      async () => {
+        using dir = tempDir("node-test-files-error", {
+          "replaces-restore.js": `
+            const { test, mock } = require("node:test");
+            // A file can reach the class of the contexts, and node:test calls restore() of each mock.
+            Object.getPrototypeOf(mock.fn().mock).restore = () => {
+              throw new Error("thrown between two files");
+            };
+            test("replaces restore() of every mock", () => {});
+          `,
+          "next-file.js": `
+            require("node:test").test("the next file runs its tests", () => {});
+          `,
+        });
+        const { tests, exitCode, stderr } = await runFiles(String(dir), ["replaces-restore.js", "next-file.js"]);
+        expect(stderr).toContain("error: thrown between two files");
+        expect({ tests, exitCode, errors: stderr.match(/^ *\d+ errors?$/m)?.[0].trim() }, stderr).toEqual({
+          tests: ["(pass) replaces restore() of every mock", "(pass) the next file runs its tests"],
+          exitCode: 1,
+          errors: "1 error",
+        });
+      },
+      timeout,
+    );
+
     // A file is loaded again, or after another one, in the realm that the file before it used.
     // `--parallel` starts a second worker only after the delay, so one worker loads every file.
     test.each([
