@@ -10,7 +10,7 @@ const {
   validateUint32,
 } = require("internal/validators");
 const { addAbortListener } = require("internal/abort_listener");
-const { slotMocked, slotRestored } = require("internal/test_runner/mock_slots");
+const { slotFaked, slotRestored, restoreSkipped, putDescriptor } = require("internal/test_runner/mock_slots");
 
 const nodeTimers = require("node:timers");
 
@@ -228,18 +228,6 @@ class Timeout {
   }
 }
 
-// What a slot held before a fake replaced it, and what reset() writes back. See mock_slots.ts.
-function takeDescriptor(object: object, key: string) {
-  const descriptor = Object.getOwnPropertyDescriptor(object, key);
-  if (descriptor !== undefined) slotMocked(object, key, descriptor);
-  return descriptor;
-}
-
-function putDescriptor(object: object, key: string, descriptor: PropertyDescriptor) {
-  Object.defineProperty(object, key, descriptor);
-  slotRestored(object, key, descriptor);
-}
-
 class MockTimers {
   #realSetTimeout;
   #realClearTimeout;
@@ -251,6 +239,7 @@ class MockTimers {
   #realPromisifiedSetTimeout;
   #realPromisifiedSetInterval;
   #realTimersPromisifiedSchedulerWait!: (delay: number, options?: PromisifiedTimerOptions) => Promise<unknown>;
+  #schedulerWaitDescriptor: PropertyDescriptor | undefined;
 
   #realTimersSetTimeout;
   #realTimersClearTimeout;
@@ -293,7 +282,12 @@ class MockTimers {
   }
 
   #restoreOriginalSchedulerWait() {
-    nodeTimersPromises.scheduler.wait = this.#realTimersPromisifiedSchedulerWait.bind(this);
+    const { scheduler } = nodeTimersPromises;
+    if (restoreSkipped(scheduler, "wait")) return;
+    // As in node, a bound copy. The file boundary writes the descriptor itself.
+    const wait = this.#realTimersPromisifiedSchedulerWait.bind(this);
+    scheduler.wait = wait;
+    slotRestored(scheduler, "wait", this.#schedulerWaitDescriptor, wait);
   }
 
   #restoreOriginalSetTimeout() {
@@ -305,37 +299,36 @@ class MockTimers {
   }
 
   #storeOriginalSetImmediate() {
-    this.#realSetImmediate = takeDescriptor(globalThis, "setImmediate");
-    this.#realClearImmediate = takeDescriptor(globalThis, "clearImmediate");
-    this.#realTimersSetImmediate = takeDescriptor(nodeTimers, "setImmediate");
-    this.#realTimersClearImmediate = takeDescriptor(nodeTimers, "clearImmediate");
-    this.#realPromisifiedSetImmediate = takeDescriptor(nodeTimersPromises, "setImmediate");
+    this.#realSetImmediate = Object.getOwnPropertyDescriptor(globalThis, "setImmediate");
+    this.#realClearImmediate = Object.getOwnPropertyDescriptor(globalThis, "clearImmediate");
+    this.#realTimersSetImmediate = Object.getOwnPropertyDescriptor(nodeTimers, "setImmediate");
+    this.#realTimersClearImmediate = Object.getOwnPropertyDescriptor(nodeTimers, "clearImmediate");
+    this.#realPromisifiedSetImmediate = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setImmediate");
   }
 
   #storeOriginalSetInterval() {
-    this.#realSetInterval = takeDescriptor(globalThis, "setInterval");
-    this.#realClearInterval = takeDescriptor(globalThis, "clearInterval");
-    this.#realTimersSetInterval = takeDescriptor(nodeTimers, "setInterval");
-    this.#realTimersClearInterval = takeDescriptor(nodeTimers, "clearInterval");
-    this.#realPromisifiedSetInterval = takeDescriptor(nodeTimersPromises, "setInterval");
+    this.#realSetInterval = Object.getOwnPropertyDescriptor(globalThis, "setInterval");
+    this.#realClearInterval = Object.getOwnPropertyDescriptor(globalThis, "clearInterval");
+    this.#realTimersSetInterval = Object.getOwnPropertyDescriptor(nodeTimers, "setInterval");
+    this.#realTimersClearInterval = Object.getOwnPropertyDescriptor(nodeTimers, "clearInterval");
+    this.#realPromisifiedSetInterval = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setInterval");
   }
 
   #storeOriginalSchedulerWait() {
-    // Listed until the file boundary: reset() writes a bound copy back, not this descriptor.
-    takeDescriptor(nodeTimersPromises.scheduler, "wait");
+    this.#schedulerWaitDescriptor = Object.getOwnPropertyDescriptor(nodeTimersPromises.scheduler, "wait");
     this.#realTimersPromisifiedSchedulerWait = nodeTimersPromises.scheduler.wait.bind(this);
   }
 
   #storeOriginalSetTimeout() {
-    this.#realSetTimeout = takeDescriptor(globalThis, "setTimeout");
-    this.#realClearTimeout = takeDescriptor(globalThis, "clearTimeout");
-    this.#realTimersSetTimeout = takeDescriptor(nodeTimers, "setTimeout");
-    this.#realTimersClearTimeout = takeDescriptor(nodeTimers, "clearTimeout");
-    this.#realPromisifiedSetTimeout = takeDescriptor(nodeTimersPromises, "setTimeout");
+    this.#realSetTimeout = Object.getOwnPropertyDescriptor(globalThis, "setTimeout");
+    this.#realClearTimeout = Object.getOwnPropertyDescriptor(globalThis, "clearTimeout");
+    this.#realTimersSetTimeout = Object.getOwnPropertyDescriptor(nodeTimers, "setTimeout");
+    this.#realTimersClearTimeout = Object.getOwnPropertyDescriptor(nodeTimers, "clearTimeout");
+    this.#realPromisifiedSetTimeout = Object.getOwnPropertyDescriptor(nodeTimersPromises, "setTimeout");
   }
 
   #storeOriginalAbortSignalTimeout() {
-    this.#realAbortSignalTimeout = takeDescriptor(AbortSignal, "timeout");
+    this.#realAbortSignalTimeout = Object.getOwnPropertyDescriptor(AbortSignal, "timeout");
   }
 
   #restoreOriginalAbortSignalTimeout() {
@@ -596,6 +589,7 @@ class MockTimers {
 
           nodeTimersPromises.scheduler.wait = (delay, options) =>
             this.#setTimeoutPromisified(delay, undefined, options);
+          slotFaked(nodeTimersPromises.scheduler, "wait", this.#schedulerWaitDescriptor);
         },
         "setTimeout": () => {
           this.#storeOriginalSetTimeout();
@@ -608,6 +602,12 @@ class MockTimers {
 
           (nodeTimersPromises as Pick<MockableTimers, "setTimeout">).setTimeout =
             this.#setTimeoutPromisified.bind(this);
+
+          slotFaked(globalThis, "setTimeout", this.#realSetTimeout);
+          slotFaked(globalThis, "clearTimeout", this.#realClearTimeout);
+          slotFaked(nodeTimers, "setTimeout", this.#realTimersSetTimeout);
+          slotFaked(nodeTimers, "clearTimeout", this.#realTimersClearTimeout);
+          slotFaked(nodeTimersPromises, "setTimeout", this.#realPromisifiedSetTimeout);
         },
         "setInterval": () => {
           this.#storeOriginalSetInterval();
@@ -620,6 +620,12 @@ class MockTimers {
 
           (nodeTimersPromises as Pick<MockableTimers, "setInterval">).setInterval =
             this.#setIntervalPromisified.bind(this);
+
+          slotFaked(globalThis, "setInterval", this.#realSetInterval);
+          slotFaked(globalThis, "clearInterval", this.#realClearInterval);
+          slotFaked(nodeTimers, "setInterval", this.#realTimersSetInterval);
+          slotFaked(nodeTimers, "clearInterval", this.#realTimersClearInterval);
+          slotFaked(nodeTimersPromises, "setInterval", this.#realPromisifiedSetInterval);
         },
         "setImmediate": () => {
           this.#storeOriginalSetImmediate();
@@ -636,10 +642,17 @@ class MockTimers {
           (nodeTimers as MockableTimers).clearImmediate = this.#clearImmediate;
           (nodeTimersPromises as Pick<MockableTimers, "setImmediate">).setImmediate =
             this.#setImmediatePromisified.bind(this);
+
+          slotFaked(globalThis, "setImmediate", this.#realSetImmediate);
+          slotFaked(globalThis, "clearImmediate", this.#realClearImmediate);
+          slotFaked(nodeTimers, "setImmediate", this.#realTimersSetImmediate);
+          slotFaked(nodeTimers, "clearImmediate", this.#realTimersClearImmediate);
+          slotFaked(nodeTimersPromises, "setImmediate", this.#realPromisifiedSetImmediate);
         },
         "Date": () => {
-          this.#nativeDateDescriptor = takeDescriptor(globalThis, "Date");
+          this.#nativeDateDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Date");
           (globalThis as { Date: unknown }).Date = this.#createDate();
+          slotFaked(globalThis, "Date", this.#nativeDateDescriptor);
         },
         "AbortSignal.timeout": () => {
           this.#storeOriginalAbortSignalTimeout();
@@ -659,6 +672,7 @@ class MockTimers {
               return controller.signal;
             },
           });
+          slotFaked(AbortSignal, "timeout", this.#realAbortSignalTimeout);
         },
       },
       toReal: {

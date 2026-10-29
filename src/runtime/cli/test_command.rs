@@ -2977,8 +2977,9 @@ impl TestCommand {
             }
 
             // node runs each `node:test` file in a process of its own. Here the file before
-            // shares this realm, so what it left is dropped before this file's first statement.
-            // It runs before `enter_file`, so an error it throws belongs to no file.
+            // shares this realm, so `node:test` undoes the mocks it left before this file's
+            // first statement. No file is entered yet: what the call throws or rejects is
+            // reported here, and not counted against the file that is about to load.
             if let Some(on_file_boundary) = vm
                 .rare_data
                 .as_deref()
@@ -2991,6 +2992,7 @@ impl TestCommand {
                     jsc::JSValue::UNDEFINED,
                     &[],
                 );
+                let _ = vm.global().handle_rejected_promises();
             }
 
             let bun_test_root = &mut jest::Jest::runner().unwrap().bun_test_root;

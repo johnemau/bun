@@ -8,7 +8,14 @@
 
 const { jest } = Bun;
 const { kEmptyObject, throwNotImplemented } = require("internal/shared");
-const { trackMockedSlots, slotMocked, slotRestored, restoreMockedSlots } = require("internal/test_runner/mock_slots");
+const {
+  trackMockedSlots,
+  slotMocked,
+  slotRestored,
+  restoreSkipped,
+  startFileBoundary,
+  restoreMockedSlots,
+} = require("internal/test_runner/mock_slots");
 const {
   validateBoolean,
   validateInteger,
@@ -773,6 +780,7 @@ function reportNodeToRunParent(node: TestNode, startedAt: number) {
 // API reference: https://nodejs.org/api/test.html#class-mocktracker
 // -----------------------------------------------------------------------------
 let trackMockCall: (ctx: MockFunctionContext, thisArg: unknown, args: unknown[], target: unknown) => unknown;
+let callOriginalFromNowOn: (ctx: object) => void;
 
 class MockFunctionContext {
   #calls: unknown[];
@@ -840,6 +848,12 @@ class MockFunctionContext {
   }
 
   static {
+    // For a mock whose slot refuses the descriptor it had: see resetTrackerAtFileBoundary().
+    callOriginalFromNowOn = function callOriginalFromNowOn(ctx: object) {
+      if (!(#calls in ctx)) return;
+      ctx.#implementation = undefined;
+      ctx.#onceImplementations.$clear();
+    };
     trackMockCall = function trackMockCall(
       ctx: MockFunctionContext,
       thisArg: unknown,
@@ -912,23 +926,19 @@ class MockPropertyContext {
     this.#descriptor = descriptor;
 
     const { configurable, enumerable } = descriptor;
-    Object.defineProperty(object, propertyName, {
-      // @ts-ignore
-      __proto__: null,
-      configurable,
-      enumerable,
-      get: () => {
-        const nextValue = this.#getAccessValue(this.#value);
-        this.#accesses.push({
-          type: "get",
-          value: nextValue,
-          stack: new Error(),
-        });
-        return nextValue;
-      },
-      set: this.mockImplementation.bind(this),
-    });
-    slotMocked(object, propertyName, descriptor);
+    const get = () => {
+      const nextValue = this.#getAccessValue(this.#value);
+      this.#accesses.push({
+        type: "get",
+        value: nextValue,
+        stack: new Error(),
+      });
+      return nextValue;
+    };
+    const set = this.mockImplementation.bind(this);
+    // @ts-ignore
+    Object.defineProperty(object, propertyName, { __proto__: null, configurable, enumerable, get, set });
+    slotMocked(object, propertyName, descriptor, get, set);
   }
 
   get accesses() {
@@ -974,6 +984,7 @@ class MockPropertyContext {
   }
 
   restore() {
+    if (restoreSkipped(this.#object, this.#propertyName)) return;
     Object.defineProperty(this.#object, this.#propertyName, {
       // @ts-ignore
       __proto__: null,
@@ -1019,17 +1030,25 @@ class MockTracker {
   #timers: unknown;
 
   static {
-    // reset(), except that a restore that throws does not stop the rest: see onFileBoundary().
+    // reset() for onFileBoundary(), where nothing may fail. A mock whose restore throws calls
+    // the original from then on: its slot keeps it, as a mock.getter() on a stream does in node.
     resetTrackerAtFileBoundary = function resetTrackerAtFileBoundary(tracker: MockTracker) {
-      for (const { ctx } of tracker.#mocks) {
+      const mocks = tracker.#mocks;
+      tracker.#mocks = [];
+      for (let i = 0; i < mocks.length; i++) {
+        const { ctx } = mocks[i];
         try {
           ctx.restore();
-        } catch {}
+        } catch {
+          callOriginalFromNowOn(ctx);
+        }
       }
       try {
         (tracker.#timers as { reset: () => void } | undefined)?.reset();
-      } catch {}
-      tracker.#mocks = [];
+      } catch {
+        // reset() stopped at a slot that refused, and these timers still count as enabled.
+        tracker.#timers = undefined;
+      }
     };
   }
 
@@ -1186,6 +1205,7 @@ class MockTracker {
     }
 
     const restore = function restore() {
+      if (restoreSkipped(objectOrFunction, methodName)) return;
       // @ts-ignore
       Object.defineProperty(objectOrFunction, methodName, { __proto__: null, ...descriptor! });
       slotRestored(objectOrFunction, methodName, descriptor!);
@@ -1211,7 +1231,7 @@ class MockTracker {
       mockDescriptor.writable = descriptor.writable;
     }
     Object.defineProperty(objectOrFunction, methodName, mockDescriptor);
-    slotMocked(objectOrFunction, methodName, descriptor);
+    slotMocked(objectOrFunction, methodName, target === objectOrFunction ? descriptor : undefined, mocked);
     return mocked;
   }
 
@@ -1679,19 +1699,23 @@ function armFileBoundary() {
   if (armFileBoundaryInRunner(onFileBoundary)) trackMockedSlots();
 }
 
-// `bun test` calls this before it loads a test file, if an earlier file of the run used this
-// module. node gives each test file a process, so there no state of this module, and no mock
-// a file left installed, reaches the next file. Nothing here may throw: a process that ends
-// cannot fail, and a mock.getter() on a stream cannot be restored in node either.
+// `bun test` calls this before it loads a test file, once a file of the run has used this
+// module. node gives each test file a process, so there no state of this module reaches the
+// next file, and no mock does. Here the mocks that the file left are undone. No step stops the
+// next one: in node the end of a process cannot fail.
 function onFileBoundary() {
   const oldRoot = rootNode;
   // Not a new root: a root takes its file from Bun.main, which still names the file that ended.
   rootNode = undefined;
-  // The root's own tracker is the `t.mock` of a file-level hook, not the module-level `mock`.
-  const rootTracker = oldRoot?.mockTracker;
-  if (rootTracker) resetTrackerAtFileBoundary(rootTracker);
-  resetTrackerAtFileBoundary(mock);
-  restoreMockedSlots();
+  startFileBoundary();
+  try {
+    // The root's own tracker is the `t.mock` of a file-level hook, not the module-level `mock`.
+    const rootTracker = oldRoot?.mockTracker;
+    if (rootTracker) resetTrackerAtFileBoundary(rootTracker);
+    resetTrackerAtFileBoundary(mock);
+  } finally {
+    restoreMockedSlots();
+  }
   customAssertions = { __proto__: null } as unknown as Record<string, Function>;
   tagsExperimentalWarningEmitted = false;
 }
