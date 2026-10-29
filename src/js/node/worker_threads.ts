@@ -364,14 +364,21 @@ const BUN_WORKER_MESSAGING_KEY = "@@bunWorkerThreadsMessaging";
 // stdio and control ports.
 const BUN_WORKER_PARENT_PORT_KEY = "@@bunWorkerThreadsParentPort";
 
-const { makePortReadable, makePortWritable } = require("internal/worker/stdio");
+const { makeStreamPorts, makePortReadable, makePortWritable } = require("internal/worker/stdio");
 
-// The parent always sends stdout and stderr ports; stdin only for { stdin: true }.
-// With the ports registered on the global, process.stdin/stdout/stderr's native
+// The parent always sends the stdio port; stdin is a stream of it only for { stdin: true }.
+// With the streams' ports registered on the global, process.stdin/stdout/stderr's native
 // lazy getters build the port-backed streams (never the fd-backed ones a plain
 // thread would get); read them here so they exist before user code, as in node.
-function setupWorkerStdio(stdio) {
-  _setStdioPorts(stdio);
+// Registering also holds the port's delivery until the entry module's first turn has run.
+function setupWorkerStdio(stdio: { port: MessagePort; stdin: boolean }) {
+  const ports = makeStreamPorts(stdio.port);
+  _setStdioPorts({
+    port: stdio.port,
+    stdin: stdio.stdin ? ports.stdin : undefined,
+    stdout: ports.stdout,
+    stderr: ports.stderr,
+  });
   const stdoutStream = process.stdout;
   const stderrStream = process.stderr;
   // node always replaces a worker's process.stdin: port-backed when { stdin: true },
@@ -840,11 +847,12 @@ class Worker extends EventEmitter {
   #performance;
   #name: string;
   #exited = false;
-  #stdinPort: MessagePort | undefined;
-  #stdoutPort: MessagePort | undefined;
+  // The parent end of the stdio channel, its three streams' shares of it, and whether worker.stdin exists.
+  #stdioPort!: MessagePort;
+  #stdio!: ReturnType<typeof makeStreamPorts>;
+  #hasStdin = false;
   // node's kPublicPort: parent end of the parentPort channel.
   #publicPort!: MessagePort;
-  #stderrPort: MessagePort | undefined;
   #stdin: ReturnType<typeof makePortWritable> | undefined;
   #stdout: ReturnType<typeof makePortReadable> | undefined;
   #stderr: ReturnType<typeof makePortReadable> | undefined;
@@ -898,34 +906,18 @@ class Worker extends EventEmitter {
       // transferList entry or a busy FileHandle's kTransfer()).
       options = packJSTransferables(options);
 
-      // Captured stdio: one control MessageChannel per requested stream; the parent keeps
-      // one end, the other rides in workerData and the worker rebinds its stdio to it.
-      const stdioForWorker: any = {};
-      const stdioTransfer: any[] = [];
-      if (options.stdin) {
-        const channel = new MessageChannel();
-        this.#stdinPort = channel.port1;
-        stdioForWorker.stdin = channel.port2;
-        stdioTransfer.push(channel.port2);
-      }
+      // Stdio: one MessageChannel for the three streams, as node's one internal port. The parent
+      // keeps one end, the other rides in workerData and the worker rebinds its stdio to it.
+      const stdioChannel = new MessageChannel();
+      this.#stdioPort = stdioChannel.port1;
+      const hasStdin = !!options.stdin;
+      const stdioForWorker = { port: stdioChannel.port2, stdin: hasStdin };
       // worker.stdout/stderr are always Readables fed by the worker; without capture
       // they auto-pipe to the parent's stdio so output still surfaces.
       const stdoutAutoPipe = !options.stdout;
       const stderrAutoPipe = !options.stderr;
-      {
-        const channel = new MessageChannel();
-        this.#stdoutPort = channel.port1;
-        stdioForWorker.stdout = channel.port2;
-        stdioTransfer.push(channel.port2);
-      }
-      {
-        const channel = new MessageChannel();
-        this.#stderrPort = channel.port1;
-        stdioForWorker.stderr = channel.port2;
-        stdioTransfer.push(channel.port2);
-      }
-      // Control channel for postMessageToThread; wrap workerData so the control and
-      // stdio ports ride along transferred.
+      // Control channel for postMessageToThread; wrap workerData so the control port and
+      // the stdio port ride along transferred.
       const channel = messaging.createMessagingChannel();
       portToMain = channel.portToMain;
       const portToWorker = channel.portToWorker;
@@ -950,8 +942,8 @@ class Worker extends EventEmitter {
         name: this.#name,
         workerData: workerDataWrapper,
         transferList: options.transferList
-          ? [...options.transferList, portToWorker, parentPortForWorker, ...stdioTransfer]
-          : [portToWorker, parentPortForWorker, ...stdioTransfer],
+          ? [...options.transferList, portToWorker, parentPortForWorker, stdioChannel.port2]
+          : [portToWorker, parentPortForWorker, stdioChannel.port2],
       };
 
       // env: SHARE_ENV becomes a native boolean flag so it passes native option
@@ -969,8 +961,10 @@ class Worker extends EventEmitter {
       // Create the readables eagerly so the worker's writev is ack'd even when
       // worker.stdout/stderr is never touched; only captured streams ref their
       // port on first read (node's kIncrementsPortRef).
-      this.#stdout = makePortReadable(this.#stdoutPort, !stdoutAutoPipe, _receiveMessageOnPort);
-      this.#stderr = makePortReadable(this.#stderrPort, !stderrAutoPipe, _receiveMessageOnPort);
+      this.#stdio = makeStreamPorts(this.#stdioPort, _receiveMessageOnPort);
+      this.#hasStdin = hasStdin;
+      this.#stdout = makePortReadable(this.#stdio.stdout, !stdoutAutoPipe);
+      this.#stderr = makePortReadable(this.#stdio.stderr, !stderrAutoPipe);
       // 'data' instead of pipe(): pipe() adds an error listener on the shared
       // process.stdout per worker, tripping MaxListenersExceededWarning.
       if (stdoutAutoPipe) this.#stdout.on("data", chunk => process.stdout.write(chunk));
@@ -996,7 +990,7 @@ class Worker extends EventEmitter {
     // off — the agent module is a tiny one-time load.
     require("internal/trace_events").emitWorkerThreadName(options.name, this.#worker.threadId);
     this.#worker.addEventListener("close", this.#onClose.bind(this), { once: true });
-    this.#worker.addEventListener("error", this.#onError.bind(this));
+    this.#worker.addEventListener("error", this.#afterStdio(this.#onError));
     this.#worker.addEventListener("open", this.#onOpen.bind(this), {
       once: true,
     });
@@ -1004,7 +998,7 @@ class Worker extends EventEmitter {
     // starts the port. Node's setupPortReferencing: the port counts toward the
     // parent's liveness only while this Worker has 'message' listeners (and
     // ref()/unref() also touch it, together with the handle).
-    this.#publicPort.addEventListener("message", this.#onMessage.bind(this));
+    this.#publicPort.addEventListener("message", this.#afterStdio(this.#onMessage));
     this.#publicPort.addEventListener("messageerror", this.#onMessageError.bind(this));
     this.#publicPort.unref();
     const publicPort = this.#publicPort;
@@ -1016,7 +1010,7 @@ class Worker extends EventEmitter {
     });
     // A worker may also use the Web Worker global `postMessage()` / `self.onmessage`
     // pair, which travels through the Worker object itself; surface those too.
-    this.#worker.addEventListener("message", this.#onMessage.bind(this));
+    this.#worker.addEventListener("message", this.#afterStdio(this.#onMessage));
     this.#worker.addEventListener("messageerror", this.#onMessageError.bind(this));
 
     if (this.#urlToRevoke) {
@@ -1038,7 +1032,7 @@ class Worker extends EventEmitter {
   }
 
   ref() {
-    // node's ref()/unref() touch the handle and the public port; stdio ports'
+    // node's ref()/unref() touch the handle and the public port; the stdio port's
     // ref state tracks in-flight I/O.
     this.#worker.ref();
     this.#publicPort.ref();
@@ -1050,9 +1044,9 @@ class Worker extends EventEmitter {
   }
 
   get stdin() {
-    if (this.#stdinPort === undefined) return null;
+    if (!this.#hasStdin) return null;
     if (this.#stdin === undefined) {
-      this.#stdin = makePortWritable(this.#stdinPort);
+      this.#stdin = makePortWritable(this.#stdio.stdin);
       // If the worker already exited, destroy immediately so writes fail with
       // ERR_STREAM_DESTROYED instead of silently no-oping into a closed peer.
       if (this.#exited) this.#stdin.destroy();
@@ -1207,6 +1201,9 @@ class Worker extends EventEmitter {
     // The listeners of 'data' and 'message' are called from here. Whatever they do, the
     // rest follows, 'exit' is emitted and the promise of terminate() resolves.
     try {
+      // What the worker wrote and the stdio port still holds comes first (node's kOnExit drains its port).
+      this.#stdio.deliverQueued();
+    } finally {
       // End captured stdio readables when the worker exits, even if it was
       // terminated before its own streams finished.
       if (this.#stdout) {
@@ -1215,17 +1212,13 @@ class Worker extends EventEmitter {
       if (this.#stderr) {
         this.#stderr.endFromOwner!();
       }
-    } finally {
-      // Close the captured stdout/stderr control ports so worker.ref() can't pin the
-      // parent loop after exit (mirrors #stdinPort below).
-      this.#stdoutPort?.close();
-      this.#stderrPort?.close();
-      // Tear down the parent-side stdin Writable + port so post-exit writes fail
+      // Tear down the parent-side stdin Writable so post-exit writes fail
       // (ERR_STREAM_DESTROYED) instead of silently no-oping into a closed peer.
       if (this.#stdin) {
         this.#stdin.destroy();
       }
-      this.#stdinPort?.close();
+      // Close the stdio port so worker.ref() can't pin the parent loop after exit.
+      this.#stdioPort.close();
       // node delivers everything the worker posted before it exited ahead of
       // 'exit' (kOnExit drains the public port), then closes the port.
       try {
@@ -1243,6 +1236,18 @@ class Worker extends EventEmitter {
         }
       }
     }
+  }
+
+  // node handles a worker's internal port, which carries its stdio, ahead of its public port and of
+  // 'error': what the worker wrote before it posted or threw is read before `handler` runs.
+  #afterStdio<E>(handler: (this: Worker, event: E) => void) {
+    return (event: E) => {
+      try {
+        this.#stdio.deliverQueued();
+      } finally {
+        handler.$call(this, event);
+      }
+    };
   }
 
   #onError(event: ErrorEvent) {
