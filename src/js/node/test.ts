@@ -12,7 +12,7 @@ const {
   trackMockedSlots,
   slotMocked,
   slotRestored,
-  restoreSkipped,
+  atFileBoundary,
   startFileBoundary,
   restoreMockedSlots,
 } = require("internal/test_runner/mock_slots");
@@ -780,7 +780,7 @@ function reportNodeToRunParent(node: TestNode, startedAt: number) {
 // API reference: https://nodejs.org/api/test.html#class-mocktracker
 // -----------------------------------------------------------------------------
 let trackMockCall: (ctx: MockFunctionContext, thisArg: unknown, args: unknown[], target: unknown) => unknown;
-let callOriginalFromNowOn: (ctx: object) => void;
+let callOriginalFromNowOn: (mock: Function) => void;
 
 class MockFunctionContext {
   #calls: unknown[];
@@ -848,9 +848,10 @@ class MockFunctionContext {
   }
 
   static {
-    // For a mock whose slot refuses the descriptor it had: see resetTrackerAtFileBoundary().
-    callOriginalFromNowOn = function callOriginalFromNowOn(ctx: object) {
-      if (!(#calls in ctx)) return;
+    // For the mock of a slot that cannot have back what it held: see onFileBoundary().
+    callOriginalFromNowOn = function callOriginalFromNowOn(mock: Function) {
+      const ctx: unknown = (mock as { mock?: unknown }).mock;
+      if (typeof ctx !== "object" || ctx === null || !(#calls in ctx)) return;
       ctx.#implementation = undefined;
       ctx.#onceImplementations.$clear();
     };
@@ -984,7 +985,7 @@ class MockPropertyContext {
   }
 
   restore() {
-    if (restoreSkipped(this.#object, this.#propertyName)) return;
+    if (atFileBoundary()) return;
     Object.defineProperty(this.#object, this.#propertyName, {
       // @ts-ignore
       __proto__: null,
@@ -1030,25 +1031,12 @@ class MockTracker {
   #timers: unknown;
 
   static {
-    // reset() for onFileBoundary(), where nothing may fail. A mock whose restore throws calls
-    // the original from then on: its slot keeps it, as a mock.getter() on a stream does in node.
+    // reset() without the name lookups, for onFileBoundary().
     resetTrackerAtFileBoundary = function resetTrackerAtFileBoundary(tracker: MockTracker) {
       const mocks = tracker.#mocks;
       tracker.#mocks = [];
-      for (let i = 0; i < mocks.length; i++) {
-        const { ctx } = mocks[i];
-        try {
-          ctx.restore();
-        } catch {
-          callOriginalFromNowOn(ctx);
-        }
-      }
-      try {
-        (tracker.#timers as { reset: () => void } | undefined)?.reset();
-      } catch {
-        // reset() stopped at a slot that refused, and these timers still count as enabled.
-        tracker.#timers = undefined;
-      }
+      for (let i = 0; i < mocks.length; i++) mocks[i].ctx.restore();
+      (tracker.#timers as { reset: () => void } | undefined)?.reset();
     };
   }
 
@@ -1205,7 +1193,7 @@ class MockTracker {
     }
 
     const restore = function restore() {
-      if (restoreSkipped(objectOrFunction, methodName)) return;
+      if (atFileBoundary()) return;
       // @ts-ignore
       Object.defineProperty(objectOrFunction, methodName, { __proto__: null, ...descriptor! });
       slotRestored(objectOrFunction, methodName, descriptor!);
@@ -1701,8 +1689,9 @@ function armFileBoundary() {
 
 // `bun test` calls this before it loads a test file, once a file of the run has used this
 // module. node gives each test file a process, so there no state of this module reaches the
-// next file, and no mock does. Here the mocks that the file left are undone. No step stops the
-// next one: in node the end of a process cannot fail.
+// next file, and no mock does. Here the trackers of the file forget their mocks and write
+// nothing, and restoreMockedSlots() undoes the mocks that are still installed. A mock that a
+// slot keeps, like a mock.getter() on a stream, calls the original from then on.
 function onFileBoundary() {
   const oldRoot = rootNode;
   // Not a new root: a root takes its file from Bun.main, which still names the file that ended.
@@ -1714,7 +1703,7 @@ function onFileBoundary() {
     if (rootTracker) resetTrackerAtFileBoundary(rootTracker);
     resetTrackerAtFileBoundary(mock);
   } finally {
-    restoreMockedSlots();
+    restoreMockedSlots(callOriginalFromNowOn);
   }
   customAssertions = { __proto__: null } as unknown as Record<string, Function>;
   tagsExperimentalWarningEmitted = false;

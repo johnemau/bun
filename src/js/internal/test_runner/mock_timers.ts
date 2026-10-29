@@ -10,7 +10,7 @@ const {
   validateUint32,
 } = require("internal/validators");
 const { addAbortListener } = require("internal/abort_listener");
-const { slotFaked, slotRestored, restoreSkipped, putDescriptor } = require("internal/test_runner/mock_slots");
+const { slotFaked, slotRestored, atFileBoundary, putDescriptor } = require("internal/test_runner/mock_slots");
 
 const nodeTimers = require("node:timers");
 
@@ -282,8 +282,8 @@ class MockTimers {
   }
 
   #restoreOriginalSchedulerWait() {
+    if (atFileBoundary()) return;
     const { scheduler } = nodeTimersPromises;
-    if (restoreSkipped(scheduler, "wait")) return;
     // As in node, a bound copy. The file boundary writes the descriptor itself.
     const wait = this.#realTimersPromisifiedSchedulerWait.bind(this);
     scheduler.wait = wait;

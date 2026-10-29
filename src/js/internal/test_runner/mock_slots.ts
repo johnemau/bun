@@ -15,6 +15,7 @@
 const MapConstructor = Map;
 const WeakMapConstructor = WeakMap;
 const WeakMapPrototypeGet = WeakMap.prototype.get;
+const WeakMapPrototypeHas = WeakMap.prototype.has;
 const WeakMapPrototypeSet = WeakMap.prototype.set;
 const WeakRefConstructor = WeakRef;
 const WeakRefPrototypeDeref = WeakRef.prototype.deref;
@@ -34,22 +35,21 @@ const mockFunctions = new WeakMapConstructor<Function, Origin>();
 // The slots that hold an earlier mock again, because the restore of a later one put it back.
 // Often nothing else holds their objects by then, so this does not either.
 let slotsWithEarlierMock: { object: WeakRef<object>; key: PropertyKey; origin: Origin }[] = [];
-// While node:test undoes what a file left, a restore writes only where a mock still is.
-let atFileBoundary = false;
+// While node:test undoes what a file left, the mocks write nothing back: restoreMockedSlots() does.
+let undoingFile = false;
 
 function trackMockedSlots() {
   mockedSlots ??= new MapConstructor();
 }
 
-/** The origin of the slot that `descriptor` is a mock of. undefined: it holds no mock. */
-function originOfMock(descriptor: PropertyDescriptor | undefined): Origin | undefined {
+/** The function in `descriptor` that a mock put in a slot, if one did. */
+function mockIn(descriptor: PropertyDescriptor | undefined): Function | undefined {
   if (descriptor === undefined) return undefined;
   const { value, get, set } = descriptor;
-  let origin: Origin | undefined;
-  if ($isCallable(value)) origin = WeakMapPrototypeGet.$call(mockFunctions, value);
-  if (origin === undefined && $isCallable(get)) origin = WeakMapPrototypeGet.$call(mockFunctions, get);
-  if (origin === undefined && $isCallable(set)) origin = WeakMapPrototypeGet.$call(mockFunctions, set);
-  return origin;
+  if ($isCallable(value) && WeakMapPrototypeHas.$call(mockFunctions, value)) return value;
+  if ($isCallable(get) && WeakMapPrototypeHas.$call(mockFunctions, get)) return get;
+  if ($isCallable(set) && WeakMapPrototypeHas.$call(mockFunctions, set)) return set;
+  return undefined;
 }
 
 /**
@@ -69,8 +69,8 @@ function slotMocked(
   let origin = objects.$get(object);
   if (origin === undefined) {
     // An unlisted slot can hold a mock: one that a restore put back, or one made through a proxy of `object`.
-    origin = originOfMock(found);
-    if (origin === undefined) origin = found ?? null;
+    const earlier = mockIn(found);
+    origin = earlier !== undefined ? WeakMapPrototypeGet.$call(mockFunctions, earlier) : (found ?? null);
     objects.$set(object, origin);
   }
   WeakMapPrototypeSet.$call(mockFunctions, mock, origin);
@@ -84,9 +84,9 @@ function slotFaked(object: object, key: PropertyKey, found: PropertyDescriptor |
   if ($isCallable(fake)) slotMocked(object, key, found, fake);
 }
 
-/** True when a restore must leave `object[key]` alone: the file is over and something else replaced the mock. */
-function restoreSkipped(object: object, key: PropertyKey) {
-  return atFileBoundary && originOfMock(ObjectGetOwnPropertyDescriptor(object, key)) === undefined;
+/** True while node:test undoes what a file left: a mock that is restored then writes nothing. */
+function atFileBoundary() {
+  return undoingFile;
 }
 
 /**
@@ -97,10 +97,15 @@ function slotRestored(object: object, key: PropertyKey, found: PropertyDescripto
   if (mockedSlots === undefined) return;
   let objects = mockedSlots.$get(key);
   const listed = objects?.$get(object);
-  const earlier = originOfMock(found);
+  const earlier = mockIn(found);
+  const origin: Origin =
+    listed !== undefined
+      ? listed
+      : earlier !== undefined
+        ? WeakMapPrototypeGet.$call(mockFunctions, earlier)
+        : (found ?? null);
   if (copy !== undefined) {
-    // Not what the slot held: it stays listed, and the boundary writes the origin.
-    const origin = listed !== undefined ? listed : earlier !== undefined ? earlier : (found ?? null);
+    // Not what the slot held: it stays listed, and restoreMockedSlots() writes the origin.
     if (objects === undefined) mockedSlots.$set(key, (objects = new MapConstructor()));
     objects.$set(object, origin);
     WeakMapPrototypeSet.$call(mockFunctions, copy, origin);
@@ -108,41 +113,42 @@ function slotRestored(object: object, key: PropertyKey, found: PropertyDescripto
   }
   objects?.$delete(object);
   if (earlier !== undefined) {
-    $arrayPush(slotsWithEarlierMock, {
-      object: new WeakRefConstructor(object),
-      key,
-      origin: listed !== undefined ? listed : earlier,
-    });
+    $arrayPush(slotsWithEarlierMock, { object: new WeakRefConstructor(object), key, origin });
   }
 }
 
 /** Writes back what mock timers found in `object[key]`. */
 function putDescriptor(object: object, key: PropertyKey, found: PropertyDescriptor) {
-  if (restoreSkipped(object, key)) return;
+  if (undoingFile) return;
   ObjectDefineProperty(object, key, found);
   slotRestored(object, key, found);
 }
 
-function restoreSlot(object: object, key: PropertyKey, origin: Origin) {
+function restoreSlot(object: object, key: PropertyKey, origin: Origin, refused: (mock: Function) => void) {
+  let mock: Function | undefined;
   try {
+    mock = mockIn(ObjectGetOwnPropertyDescriptor(object, key));
     // What the file or bun:test wrote over the mock since then stays.
-    if (originOfMock(ObjectGetOwnPropertyDescriptor(object, key)) === undefined) return;
-    if (origin === null) ReflectDeleteProperty(object, key);
-    else ObjectDefineProperty(object, key, origin);
+    if (mock === undefined) return;
+    if (origin !== null) ObjectDefineProperty(object, key, origin);
+    else if (!ReflectDeleteProperty(object, key)) refused(mock);
   } catch {
     // The slot refuses: its property is not configurable, or a proxy throws. In node the process
-    // ends here and nothing fails. A function mock in such a slot calls the original from now
-    // on (resetTrackerAtFileBoundary() in node:test), and the slot keeps it.
+    // ends here and nothing fails, so nothing fails here. The slot keeps the mock.
+    if (mock !== undefined) refused(mock);
   }
 }
 
 function startFileBoundary() {
-  atFileBoundary = true;
+  undoingFile = true;
 }
 
-/** Gives each slot that still holds a mock what it held before its first mock, and ends the boundary. */
-function restoreMockedSlots() {
-  atFileBoundary = false;
+/**
+ * Ends the boundary: gives each slot that still holds a mock what it held before its first mock.
+ * `refused` gets the mock of a slot that does not take that.
+ */
+function restoreMockedSlots(refused: (mock: Function) => void) {
+  undoingFile = false;
   const slots = mockedSlots;
   const withEarlierMock = slotsWithEarlierMock;
   if (slots === undefined || (slots.$size === 0 && withEarlierMock.length === 0)) return;
@@ -150,12 +156,12 @@ function restoreMockedSlots() {
   mockedSlots = new MapConstructor();
   slotsWithEarlierMock = [];
   slots.$forEach((objects, key) => {
-    objects.$forEach((origin, object) => restoreSlot(object, key, origin));
+    objects.$forEach((origin, object) => restoreSlot(object, key, origin, refused));
   });
   for (let i = 0; i < withEarlierMock.length; i++) {
     const { key, origin } = withEarlierMock[i];
     const object = WeakRefPrototypeDeref.$call(withEarlierMock[i].object);
-    if (object !== undefined) restoreSlot(object, key, origin);
+    if (object !== undefined) restoreSlot(object, key, origin, refused);
   }
 }
 
@@ -164,7 +170,7 @@ export default {
   slotMocked,
   slotFaked,
   slotRestored,
-  restoreSkipped,
+  atFileBoundary,
   putDescriptor,
   startFileBoundary,
   restoreMockedSlots,
